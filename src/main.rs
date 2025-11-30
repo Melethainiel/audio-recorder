@@ -440,8 +440,6 @@ fn build_ui(app: &Application) {
     // The user can manually position the window where they want (top-right recommended)
     // GNOME will remember the position for future sessions
 
-    let state = Rc::new(RefCell::new(RecorderState::new()));
-
     // Apply CSS for rounded corners and shadow
     let css_provider = gtk4::CssProvider::new();
     css_provider.load_from_data("
@@ -463,12 +461,32 @@ fn build_ui(app: &Application) {
         gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
     );
 
+    // Add drag gesture to move window (since we have no titlebar)
+    // Add it to a container that will receive the gesture
+    let gesture = gtk4::GestureDrag::new();
+    let window_clone = window.clone();
+    gesture.connect_drag_begin(move |gesture, x, y| {
+        if let Some(device) = gesture.device() {
+            if let Some(surface) = window_clone.surface() {
+                use gtk4::gdk;
+                if let Ok(toplevel) = surface.downcast::<gdk::Toplevel>() {
+                    toplevel.begin_move(&device, 0, x, y, gdk::CURRENT_TIME);
+                }
+            }
+        }
+    });
+
+    let state = Rc::new(RefCell::new(RecorderState::new()));
+
     // Main container
     let vbox = gtk4::Box::new(Orientation::Vertical, 10);
     vbox.set_margin_top(16);
     vbox.set_margin_bottom(16);
     vbox.set_margin_start(16);
     vbox.set_margin_end(16);
+    
+    // Add the drag gesture to vbox so user can drag from anywhere
+    vbox.add_controller(gesture);
 
     // Waveform drawing area
     let drawing_area = DrawingArea::new();
