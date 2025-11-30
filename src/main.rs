@@ -514,6 +514,10 @@ fn build_ui(app: &Application) {
     // Empty space for dragging (left side)
     let drag_area = gtk4::Box::new(Orientation::Horizontal, 0);
     drag_area.set_hexpand(true);
+    
+    // Add the drag gesture ONLY to drag_area, not whole titlebar
+    drag_area.add_controller(gesture);
+    
     titlebar.append(&drag_area);
     
     // Settings button
@@ -549,9 +553,6 @@ fn build_ui(app: &Application) {
     content.set_margin_bottom(16);
     content.set_margin_start(16);
     content.set_margin_end(16);
-    
-    // Add the drag gesture to titlebar so user can drag from title area
-    titlebar.add_controller(gesture);
 
     // Waveform drawing area
     let drawing_area = DrawingArea::new();
