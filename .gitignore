@@ -1,1 +1,27 @@
-/target
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Build artifacts
+/release/
+
+# Recordings (important!)
+*.ogg
+*.wav
+*.mp3
+*.flac
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Config (user-specific)
+.config/
