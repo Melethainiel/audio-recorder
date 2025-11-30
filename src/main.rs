@@ -61,13 +61,33 @@ fn start_tray_icon() {
         }
         
         fn activate(&mut self, _x: i32, _y: i32) {
-            // Called on left click (single or double depending on DE)
+            // Called on activation (click behavior varies by DE)
             toggle_window_visibility();
         }
         
         fn secondary_activate(&mut self, _x: i32, _y: i32) {
-            // Called on middle click - also toggle for convenience
+            // Called on middle click
             toggle_window_visibility();
+        }
+        
+        fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
+            use ksni::menu::*;
+            vec![
+                StandardItem {
+                    label: "Show/Hide".to_string(),
+                    activate: Box::new(|_| {
+                        toggle_window_visibility();
+                    }),
+                    ..Default::default()
+                }.into(),
+                StandardItem {
+                    label: "Quit".to_string(),
+                    activate: Box::new(|_| {
+                        std::process::exit(0);
+                    }),
+                    ..Default::default()
+                }.into(),
+            ]
         }
     }
     
@@ -416,15 +436,9 @@ fn build_ui(app: &Application) {
         .decorated(false) // No window borders (popup style)
         .build();
     
-    // Try to position window (limited on Wayland)
-    // On X11 this might work better
-    use gtk4::gdk;
-    if let Some(surface) = window.surface() {
-        if let Ok(toplevel) = surface.downcast::<gdk::Toplevel>() {
-            // Request window to be on top
-            toplevel.focus(0);
-        }
-    }
+    // Note: On Wayland/GNOME, we cannot force window position
+    // The user can manually position the window where they want (top-right recommended)
+    // GNOME will remember the position for future sessions
 
     let state = Rc::new(RefCell::new(RecorderState::new()));
 
@@ -544,6 +558,8 @@ fn build_ui(app: &Application) {
     *WINDOW_VISIBLE.lock().unwrap() = Some(Arc::clone(&visible));
     
     // Hide window initially
+    // Note: On first run, position the window manually in top-right corner
+    // GNOME will remember this position for future sessions
     window.hide();
     
     // Hide window when it loses focus (click outside)
