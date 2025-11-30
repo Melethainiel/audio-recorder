@@ -580,16 +580,8 @@ fn build_ui(app: &Application) {
     // GNOME will remember this position for future sessions
     window.hide();
     
-    // Hide window when it loses focus (click outside)
-    // Use try_lock to avoid deadlock
-    let visible_clone = Arc::clone(&visible);
-    let focus_controller = gtk4::EventControllerFocus::new();
-    focus_controller.connect_leave(move |_| {
-        if let Ok(mut v) = visible_clone.try_lock() {
-            *v = false;
-        }
-    });
-    window.add_controller(focus_controller);
+    // Note: We don't auto-hide on focus loss because it interferes with dragging
+    // User can hide window by clicking tray icon again or using tray menu
     
     // Monitor visibility changes from tray icon
     let window_clone = window.clone();
