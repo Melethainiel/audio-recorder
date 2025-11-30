@@ -1,12 +1,11 @@
 [package]
 name = "audio-recorder"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
 [dependencies]
-eframe = "0.29"
+gtk4 = "0.9"
+ksni = "0.2"
 cpal = "0.15"
 vorbis_rs = "0.5"
 chrono = "0.4"
-image = "0.25"
-ksni = "0.2"
