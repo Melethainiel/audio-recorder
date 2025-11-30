@@ -5,17 +5,8 @@ use std::time::{Duration, Instant};
 use chrono::Local;
 use vorbis_rs::{VorbisEncoderBuilder};
 use std::fs::File;
-use tray_icon::{TrayIconBuilder, menu::{Menu, MenuItem}};
-use tray_icon::TrayIconEvent;
-
-#[cfg(target_os = "linux")]
-use gtk;
 
 fn main() -> Result<(), eframe::Error> {
-    // Initialize GTK for tray icon (required on Linux)
-    #[cfg(target_os = "linux")]
-    gtk::init().expect("Failed to initialize GTK");
-    
     // List available audio devices at startup
     let host = cpal::default_host();
     println!("=== Available input devices ===");
@@ -34,45 +25,17 @@ fn main() -> Result<(), eframe::Error> {
             .with_inner_size([380.0, 130.0])
             .with_resizable(false)
             .with_decorations(true)
-            .with_title_shown(false)
-            .with_visible(true), // Start visible for now
+            .with_title_shown(false),
         ..Default::default()
     };
     
     eframe::run_native(
         "Audio Recorder",
         options,
-        Box::new(move |cc| {
-            Ok(Box::new(RecorderApp::new_with_tray(cc)))
+        Box::new(move |_| {
+            Ok(Box::new(RecorderApp::default()))
         }),
     )
-}
-
-// Create a simple tray icon (red circle for recording app)
-fn create_tray_icon() -> tray_icon::Icon {
-    let size = 32;
-    let mut rgba = vec![0u8; size * size * 4];
-    
-    // Draw a simple microphone icon
-    for y in 0..size {
-        for x in 0..size {
-            let idx = (y * size + x) * 4;
-            let dx = x as i32 - size as i32 / 2;
-            let dy = y as i32 - size as i32 / 2;
-            let dist = ((dx * dx + dy * dy) as f32).sqrt();
-            
-            // Simple circle icon
-            if dist < 12.0 {
-                rgba[idx] = 239;     // R - red
-                rgba[idx + 1] = 68;  // G
-                rgba[idx + 2] = 68;  // B
-                rgba[idx + 3] = 255; // A
-            }
-        }
-    }
-    
-    tray_icon::Icon::from_rgba(rgba, size as u32, size as u32)
-        .expect("Failed to create icon")
 }
 
 struct AudioSource {
@@ -102,8 +65,6 @@ struct RecorderApp {
     selected_loopback_index: Option<usize>,
     // Gain control
     mic_gain: Arc<Mutex<f32>>,
-    // Tray icon
-    _tray_icon: Option<tray_icon::TrayIcon>,
 }
 
 impl RecorderApp {
@@ -141,87 +102,7 @@ impl RecorderApp {
             selected_mic_index,
             selected_loopback_index,
             mic_gain: Arc::new(Mutex::new(1.0)), // Default gain: 1.0 (no change)
-            _tray_icon: None,
         }
-    }
-    
-    fn new_with_tray(cc: &eframe::CreationContext<'_>) -> Self {
-        let mut app = Self::new();
-        
-        // Create tray icon menu
-        let tray_menu = Menu::new();
-        let show_item = MenuItem::new("Show/Hide Window", true, None);
-        let quit_item = MenuItem::new("Quit", true, None);
-        tray_menu.append(&show_item).ok();
-        tray_menu.append(&quit_item).ok();
-        
-        // Create tray icon with proper ID for AppIndicator
-        // Try to load icon from file first, fallback to generated icon
-        let icon = if let Ok(icon_data) = std::fs::read("icon.png") {
-            match image::load_from_memory(&icon_data) {
-                Ok(img) => {
-                    let rgba = img.to_rgba8();
-                    let (width, height) = rgba.dimensions();
-                    tray_icon::Icon::from_rgba(rgba.into_raw(), width, height).ok()
-                }
-                Err(_) => None,
-            }
-        } else {
-            None
-        }.unwrap_or_else(|| create_tray_icon());
-        
-        let tray_icon = TrayIconBuilder::new()
-            .with_menu(Box::new(tray_menu))
-            .with_tooltip("Audio Recorder")
-            .with_icon(icon)
-            .with_title("Audio Recorder")
-            .with_menu_on_left_click(false)
-            .build()
-            .ok();
-        
-        if tray_icon.is_some() {
-            println!("Tray icon created successfully");
-        } else {
-            println!("Failed to create tray icon");
-        }
-        
-        app._tray_icon = tray_icon;
-        
-        // Handle tray icon events
-        let ctx = cc.egui_ctx.clone();
-        let show_item_id = show_item.id().clone();
-        let quit_item_id = quit_item.id().clone();
-        
-        std::thread::spawn(move || {
-            loop {
-                if let Ok(event) = TrayIconEvent::receiver().try_recv() {
-                    match event {
-                        TrayIconEvent::Click { .. } => {
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                        }
-                        TrayIconEvent::DoubleClick { .. } => {
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                        }
-                        _ => {}
-                    }
-                }
-                
-                if let Ok(event) = tray_icon::menu::MenuEvent::receiver().try_recv() {
-                    if event.id == show_item_id {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                    } else if event.id == quit_item_id {
-                        std::process::exit(0);
-                    }
-                }
-                
-                std::thread::sleep(Duration::from_millis(100));
-            }
-        });
-        
-        app
     }
     
     fn get_available_sources() -> Vec<AudioSource> {
@@ -268,10 +149,6 @@ impl Default for RecorderApp {
 
 impl eframe::App for RecorderApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Handle window close - hide instead of quit
-        if ctx.input(|i| i.viewport().close_requested()) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-        }
         
         // Update elapsed time
         if self.recording && !self.paused {
