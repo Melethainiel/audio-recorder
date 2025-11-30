@@ -468,6 +468,10 @@ fn build_ui(app: &Application) {
             background: #f0f0f0;
             color: #ef4444;
         }
+        .timer-label {
+            color: #1f2937;
+            font-weight: bold;
+        }
     ");
     
     gtk4::style_context_add_provider_for_display(
@@ -512,14 +516,27 @@ fn build_ui(app: &Application) {
     drag_area.set_hexpand(true);
     titlebar.append(&drag_area);
     
+    // Settings button
+    let settings_button = Button::with_label("⚙");
+    settings_button.add_css_class("close-button");
+    settings_button.set_tooltip_text(Some("Settings"));
+    settings_button.connect_clicked(move |_| {
+        println!("Settings clicked - TODO: implement settings dialog");
+    });
+    titlebar.append(&settings_button);
+    
     // Close button (right side)
     let close_button = Button::with_label("×");
     close_button.add_css_class("close-button");
     close_button.set_tooltip_text(Some("Hide window"));
     let visible_for_close = Arc::clone(&visible);
     close_button.connect_clicked(move |_| {
-        if let Ok(mut v) = visible_for_close.lock() {
+        println!("Close button clicked!");
+        if let Ok(mut v) = visible_for_close.try_lock() {
+            println!("Setting visible to false");
             *v = false;
+        } else {
+            println!("Failed to lock visible");
         }
     });
     titlebar.append(&close_button);
@@ -597,6 +614,7 @@ fn build_ui(app: &Application) {
 
     // Timer label
     let timer_label = gtk4::Label::new(Some("00:00:00"));
+    timer_label.add_css_class("timer-label");
     controls.append(&timer_label);
 
     // Record/Stop button
@@ -628,15 +646,17 @@ fn build_ui(app: &Application) {
     // Note: We don't auto-hide on focus loss because it interferes with dragging
     // User can hide window by clicking tray icon again or using tray menu
     
-    // Monitor visibility changes from tray icon
+    // Monitor visibility changes from tray icon and close button
     let window_clone = window.clone();
     let visible_clone = Arc::clone(&visible);
-    glib::timeout_add_local(Duration::from_millis(100), move || {
-        if let Ok(should_be_visible) = visible_clone.lock() {
+    glib::timeout_add_local(Duration::from_millis(50), move || {
+        if let Ok(should_be_visible) = visible_clone.try_lock() {
             let is_visible = window_clone.is_visible();
             if *should_be_visible && !is_visible {
+                println!("Showing window");
                 window_clone.present();
             } else if !*should_be_visible && is_visible {
+                println!("Hiding window");
                 window_clone.hide();
             }
         }
