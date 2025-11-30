@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-REPO="thibaudbrg/audio-recorder"
+REPO="Melethainiel/audio-recorder"
 VERSION="latest"
 
 echo "Installing Audio Recorder..."
