@@ -8,3 +8,8 @@ eframe = "0.29"
 cpal = "0.15"
 vorbis_rs = "0.5"
 chrono = "0.4"
+tray-icon = "0.18"
+image = "0.25"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = "0.18"
