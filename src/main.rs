@@ -453,6 +453,21 @@ fn build_ui(app: &Application) {
             border-radius: 22px;
             font-size: 18px;
         }
+        .close-button {
+            min-width: 32px;
+            min-height: 32px;
+            border-radius: 16px;
+            font-size: 24px;
+            font-weight: bold;
+            padding: 0;
+            background: transparent;
+            border: none;
+            color: #666;
+        }
+        .close-button:hover {
+            background: #f0f0f0;
+            color: #ef4444;
+        }
     ");
     
     gtk4::style_context_add_provider_for_display(
@@ -477,16 +492,49 @@ fn build_ui(app: &Application) {
     });
 
     let state = Rc::new(RefCell::new(RecorderState::new()));
+    
+    // Setup window visibility control (needed early for close button)
+    let visible = Arc::new(Mutex::new(false)); // Start hidden
+    *WINDOW_VISIBLE.lock().unwrap() = Some(Arc::clone(&visible));
 
     // Main container
-    let vbox = gtk4::Box::new(Orientation::Vertical, 10);
-    vbox.set_margin_top(16);
-    vbox.set_margin_bottom(16);
-    vbox.set_margin_start(16);
-    vbox.set_margin_end(16);
+    let vbox = gtk4::Box::new(Orientation::Vertical, 0);
     
-    // Add the drag gesture to vbox so user can drag from anywhere
-    vbox.add_controller(gesture);
+    // Custom title bar with close button
+    let titlebar = gtk4::Box::new(Orientation::Horizontal, 0);
+    titlebar.set_margin_top(8);
+    titlebar.set_margin_bottom(4);
+    titlebar.set_margin_start(12);
+    titlebar.set_margin_end(8);
+    
+    // Empty space for dragging (left side)
+    let drag_area = gtk4::Box::new(Orientation::Horizontal, 0);
+    drag_area.set_hexpand(true);
+    titlebar.append(&drag_area);
+    
+    // Close button (right side)
+    let close_button = Button::with_label("×");
+    close_button.add_css_class("close-button");
+    close_button.set_tooltip_text(Some("Hide window"));
+    let visible_for_close = Arc::clone(&visible);
+    close_button.connect_clicked(move |_| {
+        if let Ok(mut v) = visible_for_close.lock() {
+            *v = false;
+        }
+    });
+    titlebar.append(&close_button);
+    
+    vbox.append(&titlebar);
+    
+    // Content container
+    let content = gtk4::Box::new(Orientation::Vertical, 10);
+    content.set_margin_top(8);
+    content.set_margin_bottom(16);
+    content.set_margin_start(16);
+    content.set_margin_end(16);
+    
+    // Add the drag gesture to titlebar so user can drag from title area
+    titlebar.add_controller(gesture);
 
     // Waveform drawing area
     let drawing_area = DrawingArea::new();
@@ -530,7 +578,7 @@ fn build_ui(app: &Application) {
         }
     });
     
-    vbox.append(&drawing_area);
+    content.append(&drawing_area);
 
     // Controls
     let controls = gtk4::Box::new(Orientation::Horizontal, 20);
@@ -568,12 +616,9 @@ fn build_ui(app: &Application) {
     });
     controls.append(&record_button);
 
-    vbox.append(&controls);
+    content.append(&controls);
+    vbox.append(&content);
     window.set_child(Some(&vbox));
-
-    // Setup window visibility control from tray icon
-    let visible = Arc::new(Mutex::new(false)); // Start hidden
-    *WINDOW_VISIBLE.lock().unwrap() = Some(Arc::clone(&visible));
     
     // Hide window initially
     // Note: On first run, position the window manually in top-right corner
