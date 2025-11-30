@@ -8,11 +8,43 @@ use vorbis_rs::VorbisEncoderBuilder;
 use std::fs::File;
 use std::rc::Rc;
 use std::cell::RefCell;
+use serde::{Deserialize, Serialize};
+use std::io::{Read, Write};
 
 const APP_ID: &str = "com.audio.recorder";
 
 // Global window reference for tray icon to toggle
 static WINDOW_VISIBLE: Mutex<Option<Arc<Mutex<bool>>>> = Mutex::new(None);
+
+#[derive(Serialize, Deserialize, Clone)]
+struct Config {
+    selected_mic_index: usize,
+    selected_loopback_index: Option<usize>,
+    mic_gain: f32,
+}
+
+impl Config {
+    fn load() -> Option<Self> {
+        let config_path = dirs::config_dir()?.join("audio-recorder").join("config.json");
+        let mut file = File::open(config_path).ok()?;
+        let mut contents = String::new();
+        file.read_to_string(&mut contents).ok()?;
+        serde_json::from_str(&contents).ok()
+    }
+    
+    fn save(&self) -> std::io::Result<()> {
+        let config_dir = dirs::config_dir()
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "Config dir not found"))?
+            .join("audio-recorder");
+        
+        std::fs::create_dir_all(&config_dir)?;
+        let config_path = config_dir.join("config.json");
+        let json = serde_json::to_string_pretty(self)?;
+        let mut file = File::create(config_path)?;
+        file.write_all(json.as_bytes())?;
+        Ok(())
+    }
+}
 
 fn main() -> glib::ExitCode {
     // List available audio devices at startup
@@ -142,15 +174,31 @@ impl RecorderState {
     fn new() -> Self {
         let available_sources = Self::get_available_sources();
         
-        let selected_mic_index = available_sources
-            .iter()
-            .position(|s| !s.is_monitor && (s.name == "pulse" || s.name == "pipewire"))
-            .or_else(|| available_sources.iter().position(|s| !s.is_monitor))
+        // Try to load config, otherwise use defaults
+        let config = Config::load();
+        
+        let selected_mic_index = config
+            .as_ref()
+            .map(|c| c.selected_mic_index)
+            .filter(|&idx| idx < available_sources.len() && !available_sources[idx].is_monitor)
+            .or_else(|| {
+                available_sources
+                    .iter()
+                    .position(|s| !s.is_monitor && (s.name == "pulse" || s.name == "pipewire"))
+                    .or_else(|| available_sources.iter().position(|s| !s.is_monitor))
+            })
             .unwrap_or(0);
         
-        let selected_loopback_index = available_sources
-            .iter()
-            .position(|s| s.is_monitor);
+        let selected_loopback_index = config
+            .as_ref()
+            .and_then(|c| c.selected_loopback_index)
+            .filter(|&idx| idx < available_sources.len() && available_sources[idx].is_monitor)
+            .or_else(|| available_sources.iter().position(|s| s.is_monitor));
+        
+        let mic_gain = config
+            .as_ref()
+            .map(|c| c.mic_gain)
+            .unwrap_or(1.0);
         
         Self {
             recording: false,
@@ -169,35 +217,57 @@ impl RecorderState {
             available_sources,
             selected_mic_index,
             selected_loopback_index,
-            mic_gain: Arc::new(Mutex::new(1.0)),
+            mic_gain: Arc::new(Mutex::new(mic_gain)),
+        }
+    }
+    
+    fn save_config(&self) {
+        let config = Config {
+            selected_mic_index: self.selected_mic_index,
+            selected_loopback_index: self.selected_loopback_index,
+            mic_gain: *self.mic_gain.lock().unwrap(),
+        };
+        
+        if let Err(e) = config.save() {
+            eprintln!("Failed to save config: {}", e);
+        } else {
+            println!("Config saved successfully");
         }
     }
     
     fn get_available_sources() -> Vec<AudioSource> {
         let mut sources = Vec::new();
         
+        // Get detailed source info with descriptions
         if let Ok(output) = std::process::Command::new("pactl")
-            .args(["list", "sources", "short"])
+            .args(["list", "sources"])
             .output()
         {
             if output.status.success() {
                 if let Ok(stdout) = String::from_utf8(output.stdout) {
+                    let mut current_name = String::new();
+                    let mut current_desc = String::new();
+                    
                     for line in stdout.lines() {
-                        let parts: Vec<&str> = line.split('\t').collect();
-                        if parts.len() >= 2 {
-                            let name = parts[1].to_string();
-                            let is_monitor = name.contains(".monitor");
-                            let display_name = name
-                                .replace("alsa_input.", "")
-                                .replace("alsa_output.", "")
-                                .replace(".monitor", " (Monitor)")
-                                .replace("_", " ");
+                        let line = line.trim();
+                        
+                        if line.starts_with("Name: ") {
+                            current_name = line.strip_prefix("Name: ").unwrap_or("").to_string();
+                        } else if line.starts_with("Description: ") {
+                            current_desc = line.strip_prefix("Description: ").unwrap_or("").to_string();
                             
-                            sources.push(AudioSource {
-                                name,
-                                display_name,
-                                is_monitor,
-                            });
+                            if !current_name.is_empty() && !current_desc.is_empty() {
+                                let is_monitor = current_name.contains(".monitor");
+                                
+                                sources.push(AudioSource {
+                                    name: current_name.clone(),
+                                    display_name: current_desc.clone(),
+                                    is_monitor,
+                                });
+                                
+                                current_name.clear();
+                                current_desc.clear();
+                            }
                         }
                     }
                 }
@@ -472,6 +542,36 @@ fn build_ui(app: &Application) {
             color: #1f2937;
             font-weight: bold;
         }
+        /* Settings dialog styles */
+        .settings-combo {
+            min-height: 30px;
+            font-size: 12px;
+        }
+        .settings-combo button {
+            min-height: 30px;
+            font-size: 12px;
+            padding: 2px 6px;
+        }
+        .settings-label {
+            font-size: 11px;
+            color: #1f2937;
+        }
+        .settings-scale {
+            min-height: 24px;
+        }
+        .settings-scale slider {
+            min-height: 14px;
+            min-width: 14px;
+        }
+        .settings-button {
+            min-height: 30px;
+            min-width: 65px;
+            font-size: 12px;
+            padding: 4px 12px;
+        }
+        window.dialog headerbar {
+            min-height: 38px;
+        }
     ");
     
     gtk4::style_context_add_provider_for_display(
@@ -687,32 +787,60 @@ fn build_ui(app: &Application) {
 }
 
 fn show_settings_dialog(parent: &ApplicationWindow, state: &Rc<RefCell<RecorderState>>) {
-    use gtk4::{Dialog, Label, ComboBoxText, Box as GtkBox, ResponseType};
+    use gtk4::{Dialog, Label, ComboBoxText, Box as GtkBox, ResponseType, Button};
     
     let dialog = Dialog::builder()
         .title("Settings")
         .transient_for(parent)
         .modal(true)
-        .default_width(400)
-        .default_height(300)
+        .default_width(340)
+        .default_height(200)
         .build();
     
-    dialog.add_button("Cancel", ResponseType::Cancel);
-    dialog.add_button("Apply", ResponseType::Apply);
+    // Create custom button box with spacing
+    let button_box = GtkBox::new(Orientation::Horizontal, 12);
+    button_box.set_halign(gtk4::Align::End);
+    button_box.set_margin_top(8);
+    button_box.set_margin_bottom(8);
+    button_box.set_margin_start(12);
+    button_box.set_margin_end(12);
+    
+    let cancel_button = Button::with_label("Cancel");
+    cancel_button.add_css_class("settings-button");
+    let cancel_dialog = dialog.clone();
+    cancel_button.connect_clicked(move |_| {
+        cancel_dialog.response(ResponseType::Cancel);
+    });
+    
+    let apply_button = Button::with_label("Apply");
+    apply_button.add_css_class("settings-button");
+    apply_button.add_css_class("suggested-action");
+    let apply_dialog = dialog.clone();
+    apply_button.connect_clicked(move |_| {
+        apply_dialog.response(ResponseType::Apply);
+    });
+    
+    button_box.append(&cancel_button);
+    button_box.append(&apply_button);
     
     let content_area = dialog.content_area();
-    let vbox = GtkBox::new(Orientation::Vertical, 12);
-    vbox.set_margin_top(20);
-    vbox.set_margin_bottom(20);
-    vbox.set_margin_start(20);
-    vbox.set_margin_end(20);
+    let vbox = GtkBox::new(Orientation::Vertical, 8);
+    vbox.set_margin_top(12);
+    vbox.set_margin_bottom(12);
+    vbox.set_margin_start(12);
+    vbox.set_margin_end(12);
     
-    // Microphone selection
-    let mic_label = Label::new(Some("Microphone:"));
-    mic_label.set_halign(gtk4::Align::Start);
+    // Microphone selection section
+    let mic_label = Label::builder()
+        .label("<small>Microphone</small>")
+        .use_markup(true)
+        .halign(gtk4::Align::Start)
+        .build();
+    mic_label.add_css_class("settings-label");
     vbox.append(&mic_label);
     
     let mic_combo = ComboBoxText::new();
+    mic_combo.add_css_class("settings-combo");
     let state_borrow = state.borrow();
     let mut selected_mic_idx = 0;
     let mut combo_idx = 0;
@@ -729,14 +857,18 @@ fn show_settings_dialog(parent: &ApplicationWindow, state: &Rc<RefCell<RecorderS
     mic_combo.set_active(Some(selected_mic_idx as u32));
     vbox.append(&mic_combo);
     
-    vbox.append(&Label::new(Some(""))); // Spacer
-    
     // System audio selection
-    let loopback_label = Label::new(Some("System Audio (Loopback):"));
-    loopback_label.set_halign(gtk4::Align::Start);
+    let loopback_label = Label::builder()
+        .label("<small>System Audio (Loopback)</small>")
+        .use_markup(true)
+        .halign(gtk4::Align::Start)
+        .margin_top(6)
+        .build();
+    loopback_label.add_css_class("settings-label");
     vbox.append(&loopback_label);
     
     let loopback_combo = ComboBoxText::new();
+    loopback_combo.add_css_class("settings-combo");
     loopback_combo.append(Some("none"), "None");
     
     let mut selected_loopback_idx = 0;
@@ -760,22 +892,30 @@ fn show_settings_dialog(parent: &ApplicationWindow, state: &Rc<RefCell<RecorderS
     
     vbox.append(&loopback_combo);
     
-    vbox.append(&Label::new(Some(""))); // Spacer
-    
     // Microphone gain
-    let gain_label = Label::new(Some("Microphone Gain:"));
-    gain_label.set_halign(gtk4::Align::Start);
+    let gain_label = Label::builder()
+        .label("<small>Microphone Gain</small>")
+        .use_markup(true)
+        .halign(gtk4::Align::Start)
+        .margin_top(6)
+        .build();
+    gain_label.add_css_class("settings-label");
     vbox.append(&gain_label);
     
     let gain_value = *state_borrow.mic_gain.lock().unwrap();
     let gain_db = if gain_value > 0.0 { 20.0 * (gain_value as f64).log10() } else { -60.0 };
     
-    let gain_box = GtkBox::new(Orientation::Horizontal, 8);
+    let gain_box = GtkBox::new(Orientation::Horizontal, 6);
     let gain_scale = gtk4::Scale::with_range(Orientation::Horizontal, -20.0, 20.0, 1.0);
+    gain_scale.add_css_class("settings-scale");
     gain_scale.set_value(gain_db as f64);
     gain_scale.set_hexpand(true);
     
-    let gain_value_label = Label::new(Some(&format!("{:+.1} dB", gain_db)));
+    let gain_value_label = Label::builder()
+        .label(&format!("{:+.1} dB", gain_db))
+        .width_chars(7)
+        .build();
+    gain_value_label.add_css_class("settings-label");
     let mic_gain_clone = Arc::clone(&state_borrow.mic_gain);
     let label_clone = gain_value_label.clone();
     
@@ -793,32 +933,38 @@ fn show_settings_dialog(parent: &ApplicationWindow, state: &Rc<RefCell<RecorderS
     drop(state_borrow); // Release borrow before showing dialog
     
     content_area.append(&vbox);
+    content_area.append(&button_box);
     
     let state_clone = Rc::clone(state);
     dialog.connect_response(move |dialog, response| {
-        if response == ResponseType::Apply {
-            let mut state = state_clone.borrow_mut();
-            
-            // Update microphone
-            if let Some(id) = mic_combo.active_id() {
-                if let Ok(idx) = id.parse::<usize>() {
-                    state.selected_mic_index = idx;
-                    println!("Microphone updated to index: {}", idx);
+        if response == ResponseType::Apply || response == ResponseType::Cancel {
+            if response == ResponseType::Apply {
+                let mut state = state_clone.borrow_mut();
+                
+                // Update microphone
+                if let Some(id) = mic_combo.active_id() {
+                    if let Ok(idx) = id.parse::<usize>() {
+                        state.selected_mic_index = idx;
+                        println!("Microphone updated to index: {}", idx);
+                    }
                 }
-            }
-            
-            // Update loopback
-            if let Some(id) = loopback_combo.active_id() {
-                if id == "none" {
-                    state.selected_loopback_index = None;
-                    println!("Loopback disabled");
-                } else if let Ok(idx) = id.parse::<usize>() {
-                    state.selected_loopback_index = Some(idx);
-                    println!("Loopback updated to index: {}", idx);
+                
+                // Update loopback
+                if let Some(id) = loopback_combo.active_id() {
+                    if id == "none" {
+                        state.selected_loopback_index = None;
+                        println!("Loopback disabled");
+                    } else if let Ok(idx) = id.parse::<usize>() {
+                        state.selected_loopback_index = Some(idx);
+                        println!("Loopback updated to index: {}", idx);
+                    }
                 }
+                
+                // Save config
+                state.save_config();
             }
+            dialog.close();
         }
-        dialog.close();
     });
     
     dialog.present();

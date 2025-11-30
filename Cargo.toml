@@ -9,3 +9,6 @@ ksni = "0.2"
 cpal = "0.15"
 vorbis_rs = "0.5"
 chrono = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+dirs = "5.0"
