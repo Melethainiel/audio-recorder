@@ -1,41 +1,45 @@
 # Release Process
 
-## How to create a new release
+## How to create a new release (Automated)
 
-### 1. Build the release binaries
+### 1. Commit your changes
 
 ```bash
-./build-release.sh
+git add .
+git commit -m "Your changes"
+git push
 ```
 
-This creates:
-- `release/audio-recorder-linux-x86_64` - Binary for x86_64
-- `release/audio-recorder.png` - Icon
-
-### 2. Create a git tag
+### 2. Create and push a version tag
 
 ```bash
 git tag v0.1.0
 git push origin v0.1.0
 ```
 
-### 3. Create GitHub Release
+**That's it!** 🎉 
 
-1. Go to https://github.com/YOUR_USERNAME/audio-recorder/releases
-2. Click "Draft a new release"
-3. Select the tag you just created (v0.1.0)
-4. Set release title: "v0.1.0"
-5. Write release notes (features, fixes, etc.)
-6. Upload the files from `release/`:
-   - `audio-recorder-linux-x86_64`
-   - `audio-recorder.png`
-7. Click "Publish release"
+GitHub Actions will automatically:
+- Build the release binary
+- Create a GitHub release
+- Upload the binary and icon
+- Add installation instructions
 
-### 4. Users can now install with:
+### 3. Check the release
+
+Go to https://github.com/YOUR_USERNAME/audio-recorder/releases
+
+The release will be created automatically in a few minutes.
+
+## Manual build (optional)
+
+If you want to build locally:
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/YOUR_USERNAME/audio-recorder/master/install.sh | bash
+./build-release.sh
 ```
+
+This creates binaries in `release/` directory.
 
 ## Version numbering
 
@@ -50,3 +54,22 @@ Examples:
 - v0.1.1 - Bug fix
 - v0.2.0 - New feature
 - v1.0.0 - First stable release
+
+## What happens when you push a tag?
+
+1. GitHub Actions detects the new tag
+2. Sets up Ubuntu with GTK4, PulseAudio dependencies
+3. Installs Rust toolchain
+4. Builds the release binary (`cargo build --release`)
+5. Creates a new GitHub Release
+6. Uploads `audio-recorder-linux-x86_64` binary
+7. Uploads `audio-recorder.png` icon
+8. Adds installation instructions to the release notes
+
+## Users installation
+
+After the release is published, users can install with:
+
+```bash
+curl -sSL https://raw.githubusercontent.com/YOUR_USERNAME/audio-recorder/master/install.sh | bash
+```
