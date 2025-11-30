@@ -61,13 +61,22 @@ fn start_tray_icon() {
         }
         
         fn activate(&mut self, _x: i32, _y: i32) {
-            // Toggle window visibility
-            if let Ok(guard) = WINDOW_VISIBLE.lock() {
-                if let Some(visible_ref) = guard.as_ref() {
-                    if let Ok(mut visible) = visible_ref.lock() {
-                        *visible = !*visible;
-                        println!("Window visibility toggled to: {}", *visible);
-                    }
+            // Called on left click (single or double depending on DE)
+            toggle_window_visibility();
+        }
+        
+        fn secondary_activate(&mut self, _x: i32, _y: i32) {
+            // Called on middle click - also toggle for convenience
+            toggle_window_visibility();
+        }
+    }
+    
+    fn toggle_window_visibility() {
+        if let Ok(guard) = WINDOW_VISIBLE.lock() {
+            if let Some(visible_ref) = guard.as_ref() {
+                if let Ok(mut visible) = visible_ref.lock() {
+                    *visible = !*visible;
+                    println!("Window visibility toggled to: {}", *visible);
                 }
             }
         }
@@ -407,9 +416,15 @@ fn build_ui(app: &Application) {
         .decorated(false) // No window borders (popup style)
         .build();
     
-    // Set window type hint for popup behavior
-    // This helps window managers treat it as a popup
-    // Note: This requires platform-specific code, we'll add CSS styling instead
+    // Try to position window (limited on Wayland)
+    // On X11 this might work better
+    use gtk4::gdk;
+    if let Some(surface) = window.surface() {
+        if let Ok(toplevel) = surface.downcast::<gdk::Toplevel>() {
+            // Request window to be on top
+            toplevel.focus(0);
+        }
+    }
 
     let state = Rc::new(RefCell::new(RecorderState::new()));
 
@@ -532,10 +547,11 @@ fn build_ui(app: &Application) {
     window.hide();
     
     // Hide window when it loses focus (click outside)
+    // Use try_lock to avoid deadlock
     let visible_clone = Arc::clone(&visible);
     let focus_controller = gtk4::EventControllerFocus::new();
     focus_controller.connect_leave(move |_| {
-        if let Ok(mut v) = visible_clone.lock() {
+        if let Ok(mut v) = visible_clone.try_lock() {
             *v = false;
         }
     });
