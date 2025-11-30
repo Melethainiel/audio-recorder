@@ -524,8 +524,10 @@ fn build_ui(app: &Application) {
     let settings_button = Button::with_label("⚙");
     settings_button.add_css_class("close-button");
     settings_button.set_tooltip_text(Some("Settings"));
+    let state_for_settings = Rc::clone(&state);
+    let window_for_settings = window.clone();
     settings_button.connect_clicked(move |_| {
-        println!("Settings clicked - TODO: implement settings dialog");
+        show_settings_dialog(&window_for_settings, &state_for_settings);
     });
     titlebar.append(&settings_button);
     
@@ -682,4 +684,142 @@ fn build_ui(app: &Application) {
         drawing_area_clone.queue_draw();
         glib::ControlFlow::Continue
     });
+}
+
+fn show_settings_dialog(parent: &ApplicationWindow, state: &Rc<RefCell<RecorderState>>) {
+    use gtk4::{Dialog, Label, ComboBoxText, Box as GtkBox, ResponseType};
+    
+    let dialog = Dialog::builder()
+        .title("Settings")
+        .transient_for(parent)
+        .modal(true)
+        .default_width(400)
+        .default_height(300)
+        .build();
+    
+    dialog.add_button("Cancel", ResponseType::Cancel);
+    dialog.add_button("Apply", ResponseType::Apply);
+    
+    let content_area = dialog.content_area();
+    let vbox = GtkBox::new(Orientation::Vertical, 12);
+    vbox.set_margin_top(20);
+    vbox.set_margin_bottom(20);
+    vbox.set_margin_start(20);
+    vbox.set_margin_end(20);
+    
+    // Microphone selection
+    let mic_label = Label::new(Some("Microphone:"));
+    mic_label.set_halign(gtk4::Align::Start);
+    vbox.append(&mic_label);
+    
+    let mic_combo = ComboBoxText::new();
+    let state_borrow = state.borrow();
+    let mut selected_mic_idx = 0;
+    let mut combo_idx = 0;
+    
+    for (idx, source) in state_borrow.available_sources.iter().enumerate() {
+        if !source.is_monitor {
+            mic_combo.append(Some(&idx.to_string()), &source.display_name);
+            if idx == state_borrow.selected_mic_index {
+                selected_mic_idx = combo_idx;
+            }
+            combo_idx += 1;
+        }
+    }
+    mic_combo.set_active(Some(selected_mic_idx as u32));
+    vbox.append(&mic_combo);
+    
+    vbox.append(&Label::new(Some(""))); // Spacer
+    
+    // System audio selection
+    let loopback_label = Label::new(Some("System Audio (Loopback):"));
+    loopback_label.set_halign(gtk4::Align::Start);
+    vbox.append(&loopback_label);
+    
+    let loopback_combo = ComboBoxText::new();
+    loopback_combo.append(Some("none"), "None");
+    
+    let mut selected_loopback_idx = 0;
+    combo_idx = 1; // Start at 1 because 0 is "None"
+    
+    for (idx, source) in state_borrow.available_sources.iter().enumerate() {
+        if source.is_monitor {
+            loopback_combo.append(Some(&idx.to_string()), &source.display_name);
+            if state_borrow.selected_loopback_index == Some(idx) {
+                selected_loopback_idx = combo_idx;
+            }
+            combo_idx += 1;
+        }
+    }
+    
+    if state_borrow.selected_loopback_index.is_none() {
+        loopback_combo.set_active(Some(0));
+    } else {
+        loopback_combo.set_active(Some(selected_loopback_idx as u32));
+    }
+    
+    vbox.append(&loopback_combo);
+    
+    vbox.append(&Label::new(Some(""))); // Spacer
+    
+    // Microphone gain
+    let gain_label = Label::new(Some("Microphone Gain:"));
+    gain_label.set_halign(gtk4::Align::Start);
+    vbox.append(&gain_label);
+    
+    let gain_value = *state_borrow.mic_gain.lock().unwrap();
+    let gain_db = if gain_value > 0.0 { 20.0 * (gain_value as f64).log10() } else { -60.0 };
+    
+    let gain_box = GtkBox::new(Orientation::Horizontal, 8);
+    let gain_scale = gtk4::Scale::with_range(Orientation::Horizontal, -20.0, 20.0, 1.0);
+    gain_scale.set_value(gain_db as f64);
+    gain_scale.set_hexpand(true);
+    
+    let gain_value_label = Label::new(Some(&format!("{:+.1} dB", gain_db)));
+    let mic_gain_clone = Arc::clone(&state_borrow.mic_gain);
+    let label_clone = gain_value_label.clone();
+    
+    gain_scale.connect_value_changed(move |scale| {
+        let db = scale.value();
+        let gain = 10_f64.powf(db / 20.0);
+        *mic_gain_clone.lock().unwrap() = gain as f32;
+        label_clone.set_text(&format!("{:+.1} dB", db));
+    });
+    
+    gain_box.append(&gain_scale);
+    gain_box.append(&gain_value_label);
+    vbox.append(&gain_box);
+    
+    drop(state_borrow); // Release borrow before showing dialog
+    
+    content_area.append(&vbox);
+    
+    let state_clone = Rc::clone(state);
+    dialog.connect_response(move |dialog, response| {
+        if response == ResponseType::Apply {
+            let mut state = state_clone.borrow_mut();
+            
+            // Update microphone
+            if let Some(id) = mic_combo.active_id() {
+                if let Ok(idx) = id.parse::<usize>() {
+                    state.selected_mic_index = idx;
+                    println!("Microphone updated to index: {}", idx);
+                }
+            }
+            
+            // Update loopback
+            if let Some(id) = loopback_combo.active_id() {
+                if id == "none" {
+                    state.selected_loopback_index = None;
+                    println!("Loopback disabled");
+                } else if let Ok(idx) = id.parse::<usize>() {
+                    state.selected_loopback_index = Some(idx);
+                    println!("Loopback updated to index: {}", idx);
+                }
+            }
+        }
+        dialog.close();
+    });
+    
+    dialog.present();
 }
