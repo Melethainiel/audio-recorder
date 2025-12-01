@@ -21,6 +21,10 @@ struct Config {
     selected_mic_index: usize,
     selected_loopback_index: Option<usize>,
     mic_gain: f32,
+    save_directory: Option<String>,
+    n8n_endpoint: Option<String>,
+    n8n_enabled: bool,
+    save_locally: bool,
 }
 
 impl Config {
@@ -168,6 +172,10 @@ struct RecorderState {
     selected_mic_index: usize,
     selected_loopback_index: Option<usize>,
     mic_gain: Arc<Mutex<f32>>,
+    save_directory: Arc<Mutex<Option<String>>>,
+    n8n_endpoint: Arc<Mutex<Option<String>>>,
+    n8n_enabled: Arc<Mutex<bool>>,
+    save_locally: Arc<Mutex<bool>>,
 }
 
 impl RecorderState {
@@ -200,6 +208,24 @@ impl RecorderState {
             .map(|c| c.mic_gain)
             .unwrap_or(1.0);
         
+        let save_directory = config
+            .as_ref()
+            .and_then(|c| c.save_directory.clone());
+        
+        let n8n_endpoint = config
+            .as_ref()
+            .and_then(|c| c.n8n_endpoint.clone());
+        
+        let n8n_enabled = config
+            .as_ref()
+            .map(|c| c.n8n_enabled)
+            .unwrap_or(false);
+        
+        let save_locally = config
+            .as_ref()
+            .map(|c| c.save_locally)
+            .unwrap_or(true);
+        
         Self {
             recording: false,
             paused: false,
@@ -218,6 +244,10 @@ impl RecorderState {
             selected_mic_index,
             selected_loopback_index,
             mic_gain: Arc::new(Mutex::new(mic_gain)),
+            save_directory: Arc::new(Mutex::new(save_directory)),
+            n8n_endpoint: Arc::new(Mutex::new(n8n_endpoint)),
+            n8n_enabled: Arc::new(Mutex::new(n8n_enabled)),
+            save_locally: Arc::new(Mutex::new(save_locally)),
         }
     }
     
@@ -226,6 +256,10 @@ impl RecorderState {
             selected_mic_index: self.selected_mic_index,
             selected_loopback_index: self.selected_loopback_index,
             mic_gain: *self.mic_gain.lock().unwrap(),
+            save_directory: self.save_directory.lock().unwrap().clone(),
+            n8n_endpoint: self.n8n_endpoint.lock().unwrap().clone(),
+            n8n_enabled: *self.n8n_enabled.lock().unwrap(),
+            save_locally: *self.save_locally.lock().unwrap(),
         };
         
         if let Err(e) = config.save() {
@@ -454,7 +488,21 @@ impl RecorderState {
             let timestamp = Local::now().format("%Y%m%d_%H%M%S");
             let filename = format!("recording_{}.ogg", timestamp);
             
-            if let Ok(mut file) = File::create(&filename) {
+            // Get save directory from config or use current directory
+            let save_dir = self.save_directory.lock().unwrap().clone();
+            let file_path = if let Some(dir) = save_dir {
+                // Create directory if it doesn't exist
+                if let Err(e) = std::fs::create_dir_all(&dir) {
+                    eprintln!("Failed to create directory {}: {}", dir, e);
+                    filename.clone() // Fallback to current directory
+                } else {
+                    format!("{}/{}", dir.trim_end_matches('/'), filename)
+                }
+            } else {
+                filename.clone()
+            };
+            
+            if let Ok(mut file) = File::create(&file_path) {
                 use std::num::NonZero;
                 
                 let sample_rate = NonZero::new(self.sample_rate).unwrap();
@@ -478,7 +526,39 @@ impl RecorderState {
                         if let Err(e) = encoder.finish() {
                             eprintln!("Error finishing encoder: {:?}", e);
                         } else {
-                            println!("Saved: {}", filename);
+                            println!("Saved: {}", file_path);
+                            
+                            // Upload to N8N if enabled
+                            let n8n_enabled = *self.n8n_enabled.lock().unwrap();
+                            if n8n_enabled {
+                                if let Some(endpoint) = self.n8n_endpoint.lock().unwrap().clone() {
+                                    let save_locally = *self.save_locally.lock().unwrap();
+                                    let path_for_upload = file_path.clone();
+                                    
+                                    // Spawn async upload task
+                                    glib::spawn_future_local(async move {
+                                        match upload_to_n8n(&path_for_upload, &endpoint).await {
+                                            Ok(_) => {
+                                                println!("Upload to N8N succeeded");
+                                                show_notification("Upload réussi", "Le fichier a été envoyé à N8N");
+                                                
+                                                // Delete local file if not configured to keep it
+                                                if !save_locally {
+                                                    if let Err(e) = std::fs::remove_file(&path_for_upload) {
+                                                        eprintln!("Failed to delete local file: {}", e);
+                                                    } else {
+                                                        println!("Local file deleted (save_locally=false)");
+                                                    }
+                                                }
+                                            }
+                                            Err(e) => {
+                                                eprintln!("Upload to N8N failed: {}", e);
+                                                show_notification("Échec de l'upload", &format!("Erreur: {}", e));
+                                            }
+                                        }
+                                    });
+                                }
+                            }
                         }
                     }
                 }
@@ -494,6 +574,71 @@ impl RecorderState {
         let mut history = self.waveform_history.lock().unwrap();
         history.iter_mut().for_each(|v| *v = 0.0);
     }
+}
+
+async fn upload_to_n8n(file_path: &str, endpoint: &str) -> Result<(), Box<dyn std::error::Error>> {
+    use reqwest::multipart;
+    
+    println!("Starting upload to N8N: {} -> {}", file_path, endpoint);
+    
+    // Read file
+    let file_content = tokio::fs::read(file_path).await?;
+    let filename = std::path::Path::new(file_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("recording.ogg")
+        .to_string();
+    
+    // Create multipart form
+    let file_part = multipart::Part::bytes(file_content)
+        .file_name(filename.clone())
+        .mime_str("audio/ogg")?;
+    
+    let form = multipart::Form::new()
+        .part("file", file_part)
+        .text("filename", filename)
+        .text("timestamp", Local::now().to_rfc3339());
+    
+    // Send request with 30s timeout
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?;
+    
+    let response = client
+        .post(endpoint)
+        .multipart(form)
+        .send()
+        .await?;
+    
+    if response.status().is_success() {
+        Ok(())
+    } else {
+        Err(format!("HTTP {}: {}", response.status(), response.text().await?).into())
+    }
+}
+
+fn show_notification(title: &str, body: &str) {
+    // Convert to owned strings before async block
+    let title = title.to_string();
+    let body = body.to_string();
+    
+    // Using GTK for notifications in main thread
+    glib::spawn_future_local(async move {
+        glib::idle_add_local_once(move || {
+            use gtk4::{MessageDialog, DialogFlags, MessageType, ButtonsType};
+            let dialog = MessageDialog::new(
+                None::<&gtk4::Window>,
+                DialogFlags::empty(),
+                MessageType::Info,
+                ButtonsType::Ok,
+                &format!("{}\n\n{}", title, body),
+            );
+            dialog.connect_response(|dialog, _| {
+                dialog.close();
+            });
+            dialog.present();
+        });
+    });
 }
 
 fn build_ui(app: &Application) {
@@ -930,6 +1075,102 @@ fn show_settings_dialog(parent: &ApplicationWindow, state: &Rc<RefCell<RecorderS
     gain_box.append(&gain_value_label);
     vbox.append(&gain_box);
     
+    // Save directory section
+    let save_dir_label = Label::builder()
+        .label("<small>Dossier d'enregistrement</small>")
+        .use_markup(true)
+        .halign(gtk4::Align::Start)
+        .margin_top(6)
+        .build();
+    save_dir_label.add_css_class("settings-label");
+    vbox.append(&save_dir_label);
+    
+    let save_dir_box = GtkBox::new(Orientation::Horizontal, 6);
+    let save_dir_entry = gtk4::Entry::new();
+    save_dir_entry.set_hexpand(true);
+    let current_dir = state_borrow.save_directory.lock().unwrap().clone()
+        .unwrap_or_else(|| "Dossier courant".to_string());
+    save_dir_entry.set_text(&current_dir);
+    save_dir_entry.set_placeholder_text(Some("Dossier courant"));
+    
+    let browse_button = Button::with_label("Parcourir...");
+    browse_button.add_css_class("settings-button");
+    
+    let parent_for_picker = parent.clone();
+    let entry_for_picker = save_dir_entry.clone();
+    browse_button.connect_clicked(move |_| {
+        use gtk4::{FileChooserDialog, FileChooserAction, ResponseType};
+        
+        let file_chooser = FileChooserDialog::new(
+            Some("Sélectionner le dossier d'enregistrement"),
+            Some(&parent_for_picker),
+            FileChooserAction::SelectFolder,
+            &[("Annuler", ResponseType::Cancel), ("Sélectionner", ResponseType::Accept)],
+        );
+        
+        let entry_clone = entry_for_picker.clone();
+        file_chooser.connect_response(move |dialog, response| {
+            if response == ResponseType::Accept {
+                if let Some(file) = dialog.file() {
+                    if let Some(path) = file.path() {
+                        if let Some(path_str) = path.to_str() {
+                            entry_clone.set_text(path_str);
+                        }
+                    }
+                }
+            }
+            dialog.close();
+        });
+        
+        file_chooser.present();
+    });
+    
+    save_dir_box.append(&save_dir_entry);
+    save_dir_box.append(&browse_button);
+    vbox.append(&save_dir_box);
+    
+    // N8N Upload section
+    let n8n_label = Label::builder()
+        .label("<small>Upload N8N</small>")
+        .use_markup(true)
+        .halign(gtk4::Align::Start)
+        .margin_top(10)
+        .build();
+    n8n_label.add_css_class("settings-label");
+    vbox.append(&n8n_label);
+    
+    let n8n_enabled_check = gtk4::CheckButton::with_label("Activer l'upload vers N8N");
+    n8n_enabled_check.set_active(*state_borrow.n8n_enabled.lock().unwrap());
+    vbox.append(&n8n_enabled_check);
+    
+    let n8n_endpoint_label = Label::builder()
+        .label("<small>URL de l'endpoint N8N</small>")
+        .use_markup(true)
+        .halign(gtk4::Align::Start)
+        .margin_top(4)
+        .build();
+    n8n_endpoint_label.add_css_class("settings-label");
+    vbox.append(&n8n_endpoint_label);
+    
+    let n8n_endpoint_entry = gtk4::Entry::new();
+    n8n_endpoint_entry.set_placeholder_text(Some("https://..."));
+    if let Some(endpoint) = state_borrow.n8n_endpoint.lock().unwrap().clone() {
+        n8n_endpoint_entry.set_text(&endpoint);
+    }
+    n8n_endpoint_entry.set_sensitive(*state_borrow.n8n_enabled.lock().unwrap());
+    
+    let endpoint_entry_clone = n8n_endpoint_entry.clone();
+    n8n_enabled_check.connect_toggled(move |check| {
+        endpoint_entry_clone.set_sensitive(check.is_active());
+    });
+    
+    vbox.append(&n8n_endpoint_entry);
+    
+    let n8n_save_locally_check = gtk4::CheckButton::with_label("Conserver le fichier localement après upload");
+    n8n_save_locally_check.set_active(*state_borrow.save_locally.lock().unwrap());
+    n8n_save_locally_check.set_margin_top(4);
+    vbox.append(&n8n_save_locally_check);
+    
     drop(state_borrow); // Release borrow before showing dialog
     
     content_area.append(&vbox);
@@ -959,6 +1200,38 @@ fn show_settings_dialog(parent: &ApplicationWindow, state: &Rc<RefCell<RecorderS
                         println!("Loopback updated to index: {}", idx);
                     }
                 }
+                
+                // Update save directory
+                let dir_text = save_dir_entry.text().to_string();
+                if dir_text.is_empty() || dir_text == "Dossier courant" {
+                    *state.save_directory.lock().unwrap() = None;
+                } else {
+                    // Expand ~ to home directory
+                    let expanded_path = if dir_text.starts_with("~/") {
+                        if let Some(home) = dirs::home_dir() {
+                            home.join(&dir_text[2..]).to_string_lossy().to_string()
+                        } else {
+                            dir_text
+                        }
+                    } else {
+                        dir_text
+                    };
+                    *state.save_directory.lock().unwrap() = Some(expanded_path);
+                    println!("Save directory updated");
+                }
+                
+                // Update N8N settings
+                *state.n8n_enabled.lock().unwrap() = n8n_enabled_check.is_active();
+                
+                let endpoint_text = n8n_endpoint_entry.text().to_string();
+                if endpoint_text.is_empty() {
+                    *state.n8n_endpoint.lock().unwrap() = None;
+                } else {
+                    *state.n8n_endpoint.lock().unwrap() = Some(endpoint_text);
+                    println!("N8N endpoint updated");
+                }
+                
+                *state.save_locally.lock().unwrap() = n8n_save_locally_check.is_active();
                 
                 // Save config
                 state.save_config();
