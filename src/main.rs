@@ -714,6 +714,17 @@ fn build_ui(app: &Application) {
             font-size: 12px;
             padding: 4px 12px;
         }
+        .settings-entry {
+            min-height: 30px;
+            font-size: 12px;
+            padding: 4px 8px;
+        }
+        .settings-check {
+            font-size: 12px;
+        }
+        .settings-check label {
+            font-size: 12px;
+        }
         window.dialog headerbar {
             min-height: 38px;
         }
@@ -1088,24 +1099,27 @@ fn show_settings_dialog(parent: &ApplicationWindow, state: &Rc<RefCell<RecorderS
     let save_dir_box = GtkBox::new(Orientation::Horizontal, 6);
     let save_dir_entry = gtk4::Entry::new();
     save_dir_entry.set_hexpand(true);
+    save_dir_entry.add_css_class("settings-entry");
     let current_dir = state_borrow.save_directory.lock().unwrap().clone()
         .unwrap_or_else(|| "Dossier courant".to_string());
     save_dir_entry.set_text(&current_dir);
     save_dir_entry.set_placeholder_text(Some("Dossier courant"));
     
-    let browse_button = Button::with_label("Parcourir...");
+    let browse_button = Button::with_label("...");
     browse_button.add_css_class("settings-button");
+    browse_button.set_tooltip_text(Some("Parcourir"));
     
     let parent_for_picker = parent.clone();
     let entry_for_picker = save_dir_entry.clone();
     browse_button.connect_clicked(move |_| {
-        use gtk4::{FileChooserDialog, FileChooserAction, ResponseType};
+        use gtk4::{FileChooserNative, FileChooserAction, ResponseType};
         
-        let file_chooser = FileChooserDialog::new(
+        let file_chooser = FileChooserNative::new(
             Some("Sélectionner le dossier d'enregistrement"),
             Some(&parent_for_picker),
             FileChooserAction::SelectFolder,
-            &[("Annuler", ResponseType::Cancel), ("Sélectionner", ResponseType::Accept)],
+            Some("Sélectionner"),
+            Some("Annuler"),
         );
         
         let entry_clone = entry_for_picker.clone();
@@ -1119,10 +1133,9 @@ fn show_settings_dialog(parent: &ApplicationWindow, state: &Rc<RefCell<RecorderS
                     }
                 }
             }
-            dialog.close();
         });
         
-        file_chooser.present();
+        file_chooser.show();
     });
     
     save_dir_box.append(&save_dir_entry);
@@ -1140,6 +1153,7 @@ fn show_settings_dialog(parent: &ApplicationWindow, state: &Rc<RefCell<RecorderS
     vbox.append(&n8n_label);
     
     let n8n_enabled_check = gtk4::CheckButton::with_label("Activer l'upload vers N8N");
+    n8n_enabled_check.add_css_class("settings-check");
     n8n_enabled_check.set_active(*state_borrow.n8n_enabled.lock().unwrap());
     vbox.append(&n8n_enabled_check);
     
@@ -1153,6 +1167,7 @@ fn show_settings_dialog(parent: &ApplicationWindow, state: &Rc<RefCell<RecorderS
     vbox.append(&n8n_endpoint_label);
     
     let n8n_endpoint_entry = gtk4::Entry::new();
+    n8n_endpoint_entry.add_css_class("settings-entry");
     n8n_endpoint_entry.set_placeholder_text(Some("https://..."));
     if let Some(endpoint) = state_borrow.n8n_endpoint.lock().unwrap().clone() {
         n8n_endpoint_entry.set_text(&endpoint);
@@ -1167,6 +1182,7 @@ fn show_settings_dialog(parent: &ApplicationWindow, state: &Rc<RefCell<RecorderS
     vbox.append(&n8n_endpoint_entry);
     
     let n8n_save_locally_check = gtk4::CheckButton::with_label("Conserver le fichier localement après upload");
+    n8n_save_locally_check.add_css_class("settings-check");
     n8n_save_locally_check.set_active(*state_borrow.save_locally.lock().unwrap());
     n8n_save_locally_check.set_margin_top(4);
     vbox.append(&n8n_save_locally_check);
