@@ -577,43 +577,40 @@ impl RecorderState {
 }
 
 async fn upload_to_n8n(file_path: &str, endpoint: &str) -> Result<(), Box<dyn std::error::Error>> {
-    use reqwest::multipart;
-    
     println!("Starting upload to N8N: {} -> {}", file_path, endpoint);
     
-    // Read file
-    let file_content = tokio::fs::read(file_path).await?;
+    // Read file synchronously (we're in a glib async context, not tokio)
+    let file_content = std::fs::read(file_path)?;
     let filename = std::path::Path::new(file_path)
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("recording.ogg")
         .to_string();
     
-    // Create multipart form
-    let file_part = multipart::Part::bytes(file_content)
+    // Create multipart form for blocking client
+    let file_part = reqwest::blocking::multipart::Part::bytes(file_content)
         .file_name(filename.clone())
         .mime_str("audio/ogg")?;
     
-    let form = multipart::Form::new()
+    let form = reqwest::blocking::multipart::Form::new()
         .part("file", file_part)
         .text("filename", filename)
         .text("timestamp", Local::now().to_rfc3339());
     
-    // Send request with 30s timeout
-    let client = reqwest::Client::builder()
+    // Send request with 30s timeout (using blocking client in async context)
+    let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()?;
     
     let response = client
         .post(endpoint)
         .multipart(form)
-        .send()
-        .await?;
+        .send()?;
     
     if response.status().is_success() {
         Ok(())
     } else {
-        Err(format!("HTTP {}: {}", response.status(), response.text().await?).into())
+        Err(format!("HTTP {}: {}", response.status(), response.text()?).into())
     }
 }
 
@@ -718,12 +715,6 @@ fn build_ui(app: &Application) {
             min-height: 30px;
             font-size: 12px;
             padding: 4px 8px;
-        }
-        .settings-check {
-            font-size: 12px;
-        }
-        .settings-check label {
-            font-size: 12px;
         }
         window.dialog headerbar {
             min-height: 38px;
@@ -1152,10 +1143,17 @@ fn show_settings_dialog(parent: &ApplicationWindow, state: &Rc<RefCell<RecorderS
     n8n_label.add_css_class("settings-label");
     vbox.append(&n8n_label);
     
-    let n8n_enabled_check = gtk4::CheckButton::with_label("Activer l'upload vers N8N");
-    n8n_enabled_check.add_css_class("settings-check");
+    let n8n_enabled_box = GtkBox::new(Orientation::Horizontal, 6);
+    let n8n_enabled_check = gtk4::CheckButton::new();
     n8n_enabled_check.set_active(*state_borrow.n8n_enabled.lock().unwrap());
-    vbox.append(&n8n_enabled_check);
+    let n8n_enabled_label = Label::builder()
+        .label("Activer l'upload vers N8N")
+        .halign(gtk4::Align::Start)
+        .build();
+    n8n_enabled_label.add_css_class("settings-label");
+    n8n_enabled_box.append(&n8n_enabled_check);
+    n8n_enabled_box.append(&n8n_enabled_label);
+    vbox.append(&n8n_enabled_box);
     
     let n8n_endpoint_label = Label::builder()
         .label("<small>URL de l'endpoint N8N</small>")
@@ -1181,11 +1179,18 @@ fn show_settings_dialog(parent: &ApplicationWindow, state: &Rc<RefCell<RecorderS
     
     vbox.append(&n8n_endpoint_entry);
     
-    let n8n_save_locally_check = gtk4::CheckButton::with_label("Conserver le fichier localement après upload");
-    n8n_save_locally_check.add_css_class("settings-check");
+    let n8n_save_locally_box = GtkBox::new(Orientation::Horizontal, 6);
+    let n8n_save_locally_check = gtk4::CheckButton::new();
     n8n_save_locally_check.set_active(*state_borrow.save_locally.lock().unwrap());
-    n8n_save_locally_check.set_margin_top(4);
-    vbox.append(&n8n_save_locally_check);
+    let n8n_save_locally_label = Label::builder()
+        .label("Conserver le fichier localement après upload")
+        .halign(gtk4::Align::Start)
+        .build();
+    n8n_save_locally_label.add_css_class("settings-label");
+    n8n_save_locally_box.append(&n8n_save_locally_check);
+    n8n_save_locally_box.append(&n8n_save_locally_label);
+    n8n_save_locally_box.set_margin_top(4);
+    vbox.append(&n8n_save_locally_box);
     
     drop(state_borrow); // Release borrow before showing dialog
     
