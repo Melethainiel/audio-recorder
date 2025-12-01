@@ -615,18 +615,23 @@ async fn upload_to_n8n(file_path: &str, endpoint: &str) -> Result<(), Box<dyn st
 fn show_notification(title: &str, body: &str) {
     use notify_rust::Notification;
     
-    // Send notification directly (synchronous with 'd' backend)
-    match Notification::new()
-        .summary(title)
-        .body(body)
-        .appname("Audio Recorder")
-        .icon("audio-input-microphone")
-        .timeout(5000) // 5 seconds
-        .show()
-    {
-        Ok(_) => println!("✓ Notification sent: {} - {}", title, body),
-        Err(e) => eprintln!("✗ Failed to send notification: {}", e),
-    }
+    let title = title.to_string();
+    let body = body.to_string();
+    
+    // Force execution in main thread
+    glib::MainContext::default().invoke(move || {
+        match Notification::new()
+            .summary(&title)
+            .body(&body)
+            .appname("Audio Recorder")
+            .icon("audio-input-microphone")
+            .timeout(5000) // 5 seconds
+            .show()
+        {
+            Ok(_) => println!("✓ Notification sent: {} - {}", title, body),
+            Err(e) => eprintln!("✗ Failed to send notification: {}", e),
+        }
+    });
 }
 
 fn build_ui(app: &Application) {
