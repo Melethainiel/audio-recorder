@@ -615,14 +615,24 @@ async fn upload_to_n8n(file_path: &str, endpoint: &str) -> Result<(), Box<dyn st
 fn show_notification(title: &str, body: &str) {
     use notify_rust::Notification;
     
-    // Use native Linux notifications
-    let _ = Notification::new()
-        .summary(title)
-        .body(body)
-        .appname("Audio Recorder")
-        .icon("audio-input-microphone")
-        .timeout(5000) // 5 seconds
-        .show();
+    // Clone strings for the closure
+    let title = title.to_string();
+    let body = body.to_string();
+    
+    // Send notification in the main GTK thread
+    glib::idle_add_local_once(move || {
+        match Notification::new()
+            .summary(&title)
+            .body(&body)
+            .appname("Audio Recorder")
+            .icon("audio-input-microphone")
+            .timeout(5000) // 5 seconds
+            .show()
+        {
+            Ok(_) => println!("Notification sent: {} - {}", title, body),
+            Err(e) => eprintln!("Failed to send notification: {}", e),
+        }
+    });
 }
 
 fn build_ui(app: &Application) {
