@@ -1,3 +1,5 @@
+mod notifier;
+
 use gtk4::prelude::*;
 use gtk4::{glib, Application, ApplicationWindow, Button, Orientation, DrawingArea};
 use std::sync::{Arc, Mutex};
@@ -15,6 +17,9 @@ const APP_ID: &str = "com.audio.recorder";
 
 // Global window reference for tray icon to toggle
 static WINDOW_VISIBLE: Mutex<Option<Arc<Mutex<bool>>>> = Mutex::new(None);
+
+// Global notifier instance
+static NOTIFIER: Mutex<Option<notifier::Notifier>> = Mutex::new(None);
 
 #[derive(Serialize, Deserialize, Clone)]
 struct Config {
@@ -51,6 +56,9 @@ impl Config {
 }
 
 fn main() -> glib::ExitCode {
+    // Initialize the notifier thread
+    *NOTIFIER.lock().unwrap() = Some(notifier::Notifier::new());
+    
     // List available audio devices at startup
     let host = cpal::default_host();
     println!("=== Available input devices ===");
@@ -613,25 +621,11 @@ async fn upload_to_n8n(file_path: &str, endpoint: &str) -> Result<(), Box<dyn st
 }
 
 fn show_notification(title: &str, body: &str) {
-    use notify_rust::Notification;
-    
-    let title = title.to_string();
-    let body = body.to_string();
-    
-    // Force execution in main thread
-    glib::MainContext::default().invoke(move || {
-        match Notification::new()
-            .summary(&title)
-            .body(&body)
-            .appname("Audio Recorder")
-            .icon("audio-input-microphone")
-            .timeout(5000) // 5 seconds
-            .show()
-        {
-            Ok(_) => println!("✓ Notification sent: {} - {}", title, body),
-            Err(e) => eprintln!("✗ Failed to send notification: {}", e),
+    if let Ok(guard) = NOTIFIER.lock() {
+        if let Some(notifier) = guard.as_ref() {
+            notifier.notify(title, body);
         }
-    });
+    }
 }
 
 fn build_ui(app: &Application) {
