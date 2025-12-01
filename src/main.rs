@@ -613,27 +613,16 @@ async fn upload_to_n8n(file_path: &str, endpoint: &str) -> Result<(), Box<dyn st
 }
 
 fn show_notification(title: &str, body: &str) {
-    // Convert to owned strings before async block
-    let title = title.to_string();
-    let body = body.to_string();
+    use notify_rust::Notification;
     
-    // Using GTK for notifications in main thread
-    glib::spawn_future_local(async move {
-        glib::idle_add_local_once(move || {
-            use gtk4::{MessageDialog, DialogFlags, MessageType, ButtonsType};
-            let dialog = MessageDialog::new(
-                None::<&gtk4::Window>,
-                DialogFlags::empty(),
-                MessageType::Info,
-                ButtonsType::Ok,
-                &format!("{}\n\n{}", title, body),
-            );
-            dialog.connect_response(|dialog, _| {
-                dialog.close();
-            });
-            dialog.present();
-        });
-    });
+    // Use native Linux notifications
+    let _ = Notification::new()
+        .summary(title)
+        .body(body)
+        .appname("Audio Recorder")
+        .icon("audio-input-microphone")
+        .timeout(5000) // 5 seconds
+        .show();
 }
 
 fn build_ui(app: &Application) {
