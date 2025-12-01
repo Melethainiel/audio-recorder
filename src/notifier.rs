@@ -24,15 +24,17 @@ impl Notifier {
     }
     
     fn send_notification(title: &str, body: &str) {
-        use notify_rust::Notification;
-        
-        match Notification::new()
-            .summary(title)
-            .body(body)
-            .appname("Audio Recorder")
-            .icon("audio-input-microphone")
-            .timeout(5000)
-            .show()
+        // Use notify-send command directly (more reliable)
+        match std::process::Command::new("notify-send")
+            .arg("-a")
+            .arg("Audio Recorder")
+            .arg("-i")
+            .arg("audio-input-microphone")
+            .arg("-t")
+            .arg("5000")
+            .arg(title)
+            .arg(body)
+            .spawn()
         {
             Ok(_) => println!("✓ Notification sent: {} - {}", title, body),
             Err(e) => eprintln!("✗ Failed to send notification: {}", e),
