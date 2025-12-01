@@ -280,7 +280,6 @@ impl RecorderState {
             if output.status.success() {
                 if let Ok(stdout) = String::from_utf8(output.stdout) {
                     let mut current_name = String::new();
-                    let mut current_desc = String::new();
                     
                     for line in stdout.lines() {
                         let line = line.trim();
@@ -288,19 +287,18 @@ impl RecorderState {
                         if line.starts_with("Name: ") {
                             current_name = line.strip_prefix("Name: ").unwrap_or("").to_string();
                         } else if line.starts_with("Description: ") {
-                            current_desc = line.strip_prefix("Description: ").unwrap_or("").to_string();
+                            let current_desc = line.strip_prefix("Description: ").unwrap_or("").to_string();
                             
                             if !current_name.is_empty() && !current_desc.is_empty() {
                                 let is_monitor = current_name.contains(".monitor");
                                 
                                 sources.push(AudioSource {
                                     name: current_name.clone(),
-                                    display_name: current_desc.clone(),
+                                    display_name: current_desc,
                                     is_monitor,
                                 });
                                 
                                 current_name.clear();
-                                current_desc.clear();
                             }
                         }
                     }
