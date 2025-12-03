@@ -174,6 +174,8 @@ struct RecorderState {
     input_samples: Arc<Mutex<Vec<f32>>>,
     output_samples: Arc<Mutex<Vec<f32>>>,
     waveform_history: Arc<Mutex<Vec<f32>>>,
+    input_waveform_history: Arc<Mutex<Vec<f32>>>,
+    output_waveform_history: Arc<Mutex<Vec<f32>>>,
     sample_rate: u32,
     channels: u16,
     available_sources: Vec<AudioSource>,
@@ -184,6 +186,147 @@ struct RecorderState {
     n8n_endpoint: Arc<Mutex<Option<String>>>,
     n8n_enabled: Arc<Mutex<bool>>,
     save_locally: Arc<Mutex<bool>>,
+}
+
+// Helper function to draw waveform bars (used by both mic and system audio visualizations)
+fn draw_waveform_bars(
+    cr: &gtk4::cairo::Context,
+    waveform_data: &[f32],
+    width: i32,
+    height: i32,
+    is_recording: bool,
+    active_color: (f64, f64, f64),
+) {
+    // Background
+    cr.set_source_rgb(0.95, 0.96, 0.96);
+    let _ = cr.rectangle(0.0, 0.0, width as f64, height as f64);
+    let _ = cr.fill();
+
+    // Bars
+    let num_bars = 60;
+    let bar_width = 3.0;
+    let spacing = (width as f64 - (num_bars as f64 * bar_width)) / (num_bars as f64 + 1.0);
+
+    for i in 0..num_bars {
+        let x = spacing + (i as f64 * (bar_width + spacing));
+        let level = waveform_data.get(i).copied().unwrap_or(0.0) as f64;
+
+        let bar_height = (level * height as f64 * 0.85).max(2.0).min(height as f64 * 0.9);
+        let y = (height as f64 - bar_height) / 2.0;
+
+        if is_recording && level > 0.05 {
+            cr.set_source_rgb(active_color.0, active_color.1, active_color.2);
+        } else {
+            cr.set_source_rgb(0.82, 0.84, 0.86); // Gray
+        }
+
+        let _ = cr.rectangle(x, y, bar_width, bar_height);
+        let _ = cr.fill();
+    }
+}
+
+// Helper function to find the pulse audio device
+fn find_pulse_device() -> Option<cpal::Device> {
+    let host = cpal::default_host();
+    host.input_devices()
+        .ok()
+        .and_then(|mut devices| {
+            devices.find(|d| d.name().map(|n| n == "pulse").unwrap_or(false))
+        })
+}
+
+// Helper function to execute code with PULSE_SOURCE environment variable set
+fn with_pulse_source<F, R>(source_name: &str, f: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    unsafe { std::env::set_var("PULSE_SOURCE", source_name) };
+    let result = f();
+    unsafe { std::env::remove_var("PULSE_SOURCE") };
+    result
+}
+
+// Helper function to convert samples to f32 format
+fn convert_i16_to_f32(data: &[i16]) -> Vec<f32> {
+    data.iter().map(|&s| s as f32 / 32768.0).collect()
+}
+
+fn convert_i32_to_f32(data: &[i32]) -> Vec<f32> {
+    data.iter().map(|&s| s as f32 / 2147483648.0).collect()
+}
+
+// Helper function to process microphone samples (handles any sample format after conversion to f32)
+fn process_mic_samples(
+    data: &[f32],
+    mic_gain: &Arc<Mutex<f32>>,
+    input_level: &Arc<Mutex<f32>>,
+    input_waveform_history: &Arc<Mutex<Vec<f32>>>,
+    input_samples: &Arc<Mutex<Vec<f32>>>,
+) {
+    let gain = *mic_gain.lock().unwrap();
+    let gained_data: Vec<f32> = data.iter()
+        .map(|&s| (s * gain).clamp(-1.0, 1.0))
+        .collect();
+    
+    let sum: f32 = gained_data.iter().map(|&s| s * s).sum();
+    let rms = (sum / gained_data.len().max(1) as f32).sqrt();
+    let mic_level = (rms * 5.0).min(1.0);
+    *input_level.lock().unwrap() = mic_level;
+    
+    // Update input waveform history
+    let mut history = input_waveform_history.lock().unwrap();
+    history.remove(0);
+    history.push(mic_level);
+    
+    input_samples.lock().unwrap().extend_from_slice(&gained_data);
+}
+
+// Helper function to process loopback samples (handles any sample format after conversion to f32)
+fn process_loopback_samples(
+    data: &[f32],
+    source_channels: u16,
+    source_sample_rate: u32,
+    target_sample_rate: u32,
+    output_level: &Arc<Mutex<f32>>,
+    output_waveform_history: &Arc<Mutex<Vec<f32>>>,
+    output_samples: &Arc<Mutex<Vec<f32>>>,
+) {
+    let sum: f32 = data.iter().map(|&s| s * s).sum();
+    let rms = (sum / data.len().max(1) as f32).sqrt();
+    let loopback_level = (rms * 5.0).min(1.0);
+    *output_level.lock().unwrap() = loopback_level;
+    
+    // Update output waveform history
+    let mut history = output_waveform_history.lock().unwrap();
+    history.remove(0);
+    history.push(loopback_level);
+    drop(history);
+    
+    let mono: Vec<f32> = data
+        .chunks(source_channels as usize)
+        .filter_map(|chunk| {
+            if chunk.is_empty() {
+                None
+            } else {
+                Some(chunk.iter().sum::<f32>() / chunk.len() as f32)
+            }
+        })
+        .collect();
+    
+    let resampled: Vec<f32> = if source_sample_rate != target_sample_rate {
+        let ratio = target_sample_rate as f32 / source_sample_rate as f32;
+        let new_len = (mono.len() as f32 * ratio) as usize;
+        (0..new_len)
+            .map(|i| {
+                let src_idx = (i as f32 / ratio) as usize;
+                mono.get(src_idx).copied().unwrap_or(0.0)
+            })
+            .collect()
+    } else {
+        mono
+    };
+    
+    output_samples.lock().unwrap().extend_from_slice(&resampled);
 }
 
 impl RecorderState {
@@ -246,6 +389,8 @@ impl RecorderState {
             input_samples: Arc::new(Mutex::new(Vec::new())),
             output_samples: Arc::new(Mutex::new(Vec::new())),
             waveform_history: Arc::new(Mutex::new(vec![0.0; 60])),
+            input_waveform_history: Arc::new(Mutex::new(vec![0.0; 60])),
+            output_waveform_history: Arc::new(Mutex::new(vec![0.0; 60])),
             sample_rate: 48000,
             channels: 1,
             available_sources,
@@ -318,8 +463,6 @@ impl RecorderState {
     }
     
     fn start_recording(&mut self) {
-        let host = cpal::default_host();
-        
         self.start_time = Some(Instant::now());
         self.elapsed = Duration::default();
         
@@ -330,57 +473,81 @@ impl RecorderState {
         if let Some(mic_name) = mic_source_name {
             println!("Using microphone: {}", mic_name);
             
-            unsafe { std::env::set_var("PULSE_SOURCE", &mic_name) };
-            
-            let pulse_device = host.input_devices()
-                .ok()
-                .and_then(|mut devices| {
-                    devices.find(|d| d.name().map(|n| n == "pulse").unwrap_or(false))
-                });
+            let pulse_device = with_pulse_source(&mic_name, find_pulse_device);
             
             if let Some(input_device) = pulse_device {
                 if let Ok(input_config) = input_device.default_input_config() {
                     self.sample_rate = input_config.sample_rate().0;
                     self.channels = input_config.channels();
                     
+                    let sample_format = input_config.sample_format();
+                    println!("Mic config: {} Hz, {} channels, format: {:?}", 
+                             self.sample_rate, self.channels, sample_format);
+                    
                     let input_level = Arc::clone(&self.input_level);
                     let input_samples = Arc::clone(&self.input_samples);
-                    let waveform_history = Arc::clone(&self.waveform_history);
-                    let output_level = Arc::clone(&self.output_level);
+                    let input_waveform_history = Arc::clone(&self.input_waveform_history);
                     let mic_gain = Arc::clone(&self.mic_gain);
                     
-                    if let Ok(mic_stream) = input_device.build_input_stream(
-                        &input_config.into(),
-                        move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                            let gain = *mic_gain.lock().unwrap();
-                            let gained_data: Vec<f32> = data.iter()
-                                .map(|&s| (s * gain).clamp(-1.0, 1.0))
-                                .collect();
-                            
-                            let sum: f32 = gained_data.iter().map(|&s| s * s).sum();
-                            let rms = (sum / gained_data.len() as f32).sqrt();
-                            let mic_level = (rms * 5.0).min(1.0);
-                            *input_level.lock().unwrap() = mic_level;
-                            
-                            let loopback_level = *output_level.lock().unwrap();
-                            let combined_level = (mic_level + loopback_level).min(1.0);
-                            
-                            let mut history = waveform_history.lock().unwrap();
-                            history.remove(0);
-                            history.push(combined_level);
-                            
-                            input_samples.lock().unwrap().extend_from_slice(&gained_data);
-                        },
-                        |err| eprintln!("Mic error: {}", err),
-                        None,
-                    ) {
-                        mic_stream.play().unwrap();
-                        self.input_stream = Some(mic_stream);
+                    let stream_config: cpal::StreamConfig = input_config.clone().into();
+                    
+                    // Build stream based on the device's native sample format
+                    let mic_stream_result = match sample_format {
+                        cpal::SampleFormat::F32 => {
+                            input_device.build_input_stream(
+                                &stream_config,
+                                move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                                    process_mic_samples(data, &mic_gain, &input_level, &input_waveform_history, &input_samples);
+                                },
+                                |err| eprintln!("Mic error: {}", err),
+                                None,
+                            )
+                        }
+                        cpal::SampleFormat::I16 => {
+                            input_device.build_input_stream(
+                                &stream_config,
+                                move |data: &[i16], _: &cpal::InputCallbackInfo| {
+                                    let float_data = convert_i16_to_f32(data);
+                                    process_mic_samples(&float_data, &mic_gain, &input_level, &input_waveform_history, &input_samples);
+                                },
+                                |err| eprintln!("Mic error: {}", err),
+                                None,
+                            )
+                        }
+                        cpal::SampleFormat::I32 => {
+                            input_device.build_input_stream(
+                                &stream_config,
+                                move |data: &[i32], _: &cpal::InputCallbackInfo| {
+                                    let float_data = convert_i32_to_f32(data);
+                                    process_mic_samples(&float_data, &mic_gain, &input_level, &input_waveform_history, &input_samples);
+                                },
+                                |err| eprintln!("Mic error: {}", err),
+                                None,
+                            )
+                        }
+                        format => {
+                            eprintln!("Unsupported sample format: {:?}", format);
+                            Err(cpal::BuildStreamError::StreamConfigNotSupported)
+                        }
+                    };
+                    
+                    match mic_stream_result {
+                        Ok(mic_stream) => {
+                            if let Err(e) = mic_stream.play() {
+                                eprintln!("Failed to start mic stream: {}", e);
+                            } else {
+                                println!("Mic stream started successfully");
+                                self.input_stream = Some(mic_stream);
+                            }
+                        }
+                        Err(e) => eprintln!("Failed to build mic stream: {}", e),
                     }
+                } else {
+                    eprintln!("Failed to get default input config for mic");
                 }
+            } else {
+                eprintln!("No pulse device found for microphone");
             }
-            
-            unsafe { std::env::remove_var("PULSE_SOURCE") };
         }
         
         // System audio loopback
@@ -391,59 +558,80 @@ impl RecorderState {
         if let Some(loopback_name) = loopback_source_name {
             println!("Using loopback: {}", loopback_name);
             
-            unsafe { std::env::set_var("PULSE_SOURCE", &loopback_name) };
-            
-            let pulse_device = host.input_devices()
-                .ok()
-                .and_then(|mut devices| {
-                    devices.find(|d| d.name().map(|n| n == "pulse").unwrap_or(false))
-                });
+            let pulse_device = with_pulse_source(&loopback_name, find_pulse_device);
             
             if let Some(loopback_device) = pulse_device {
                 if let Ok(loopback_config) = loopback_device.default_input_config() {
                     let output_level = Arc::clone(&self.output_level);
                     let output_samples = Arc::clone(&self.output_samples);
+                    let output_waveform_history = Arc::clone(&self.output_waveform_history);
                     let target_sample_rate = self.sample_rate;
                     let source_sample_rate = loopback_config.sample_rate().0;
                     let source_channels = loopback_config.channels();
+                    let sample_format = loopback_config.sample_format();
                     
-                    if let Ok(loopback_stream) = loopback_device.build_input_stream(
-                        &loopback_config.into(),
-                        move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                            let sum: f32 = data.iter().map(|&s| s * s).sum();
-                            let rms = (sum / data.len() as f32).sqrt();
-                            *output_level.lock().unwrap() = (rms * 5.0).min(1.0);
-                            
-                            let mono: Vec<f32> = data
-                                .chunks(source_channels as usize)
-                                .map(|chunk| chunk.iter().sum::<f32>() / chunk.len() as f32)
-                                .collect();
-                            
-                            let resampled: Vec<f32> = if source_sample_rate != target_sample_rate {
-                                let ratio = target_sample_rate as f32 / source_sample_rate as f32;
-                                let new_len = (mono.len() as f32 * ratio) as usize;
-                                (0..new_len)
-                                    .map(|i| {
-                                        let src_idx = (i as f32 / ratio) as usize;
-                                        mono.get(src_idx).copied().unwrap_or(0.0)
-                                    })
-                                    .collect()
+                    println!("Loopback config: {} Hz, {} channels, format: {:?}", 
+                             source_sample_rate, source_channels, sample_format);
+                    
+                    let stream_config: cpal::StreamConfig = loopback_config.clone().into();
+                    
+                    // Build stream based on the device's native sample format
+                    let loopback_stream_result = match sample_format {
+                        cpal::SampleFormat::F32 => {
+                            loopback_device.build_input_stream(
+                                &stream_config,
+                                move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                                    process_loopback_samples(data, source_channels, source_sample_rate, target_sample_rate, &output_level, &output_waveform_history, &output_samples);
+                                },
+                                |err| eprintln!("Loopback error: {}", err),
+                                None,
+                            )
+                        }
+                        cpal::SampleFormat::I16 => {
+                            loopback_device.build_input_stream(
+                                &stream_config,
+                                move |data: &[i16], _: &cpal::InputCallbackInfo| {
+                                    let float_data = convert_i16_to_f32(data);
+                                    process_loopback_samples(&float_data, source_channels, source_sample_rate, target_sample_rate, &output_level, &output_waveform_history, &output_samples);
+                                },
+                                |err| eprintln!("Loopback error: {}", err),
+                                None,
+                            )
+                        }
+                        cpal::SampleFormat::I32 => {
+                            loopback_device.build_input_stream(
+                                &stream_config,
+                                move |data: &[i32], _: &cpal::InputCallbackInfo| {
+                                    let float_data = convert_i32_to_f32(data);
+                                    process_loopback_samples(&float_data, source_channels, source_sample_rate, target_sample_rate, &output_level, &output_waveform_history, &output_samples);
+                                },
+                                |err| eprintln!("Loopback error: {}", err),
+                                None,
+                            )
+                        }
+                        format => {
+                            eprintln!("Unsupported loopback sample format: {:?}", format);
+                            Err(cpal::BuildStreamError::StreamConfigNotSupported)
+                        }
+                    };
+                    
+                    match loopback_stream_result {
+                        Ok(loopback_stream) => {
+                            if let Err(e) = loopback_stream.play() {
+                                eprintln!("Failed to start loopback stream: {}", e);
                             } else {
-                                mono
-                            };
-                            
-                            output_samples.lock().unwrap().extend_from_slice(&resampled);
-                        },
-                        |err| eprintln!("Loopback error: {}", err),
-                        None,
-                    ) {
-                        loopback_stream.play().unwrap();
-                        self.output_stream = Some(loopback_stream);
+                                println!("Loopback stream started successfully");
+                                self.output_stream = Some(loopback_stream);
+                            }
+                        }
+                        Err(e) => eprintln!("Failed to build loopback stream: {}", e),
                     }
+                } else {
+                    eprintln!("Failed to get default input config for loopback");
                 }
+            } else {
+                eprintln!("No pulse device found for loopback");
             }
-            
-            unsafe { std::env::remove_var("PULSE_SOURCE") };
         }
         
         self.recording = true;
@@ -508,67 +696,23 @@ impl RecorderState {
                 filename.clone()
             };
             
-            if let Ok(mut file) = File::create(&file_path) {
-                use std::num::NonZero;
-                
-                let sample_rate = NonZero::new(self.sample_rate).unwrap();
-                let channels = NonZero::new(1u8).unwrap();
-                
-                if let Ok(mut encoder_builder) = VorbisEncoderBuilder::new(
-                    sample_rate,
-                    channels,
-                    &mut file
-                ) {
-                    if let Ok(mut encoder) = encoder_builder.build() {
-                        let chunk_size = self.sample_rate as usize;
-                        let num_samples = mixed_samples.len();
-                        
-                        for start in (0..num_samples).step_by(chunk_size) {
-                            let end = (start + chunk_size).min(num_samples);
-                            let chunk = vec![mixed_samples[start..end].to_vec()];
-                            encoder.encode_audio_block(chunk).ok();
-                        }
-                        
-                        if let Err(e) = encoder.finish() {
-                            eprintln!("Error finishing encoder: {:?}", e);
-                        } else {
-                            println!("Saved: {}", file_path);
-                            
-                            // Upload to N8N if enabled
-                            let n8n_enabled = *self.n8n_enabled.lock().unwrap();
-                            if n8n_enabled {
-                                if let Some(endpoint) = self.n8n_endpoint.lock().unwrap().clone() {
-                                    let save_locally = *self.save_locally.lock().unwrap();
-                                    let path_for_upload = file_path.clone();
-                                    
-                                    // Spawn async upload task
-                                    glib::spawn_future_local(async move {
-                                        match upload_to_n8n(&path_for_upload, &endpoint).await {
-                                            Ok(_) => {
-                                                println!("Upload to N8N succeeded");
-                                                show_notification("Upload réussi", "Le fichier a été envoyé à N8N");
-                                                
-                                                // Delete local file if not configured to keep it
-                                                if !save_locally {
-                                                    if let Err(e) = std::fs::remove_file(&path_for_upload) {
-                                                        eprintln!("Failed to delete local file: {}", e);
-                                                    } else {
-                                                        println!("Local file deleted (save_locally=false)");
-                                                    }
-                                                }
-                                            }
-                                            Err(e) => {
-                                                eprintln!("Upload to N8N failed: {}", e);
-                                                show_notification("Échec de l'upload", &format!("Erreur: {}", e));
-                                            }
-                                        }
-                                    });
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            // Collect N8N settings before spawning thread
+            let n8n_enabled = *self.n8n_enabled.lock().unwrap();
+            let n8n_endpoint = self.n8n_endpoint.lock().unwrap().clone();
+            let save_locally = *self.save_locally.lock().unwrap();
+            let source_sample_rate = self.sample_rate;
+            
+            // Spawn encoding work on a background thread to avoid blocking the UI
+            std::thread::spawn(move || {
+                encode_and_save_recording(
+                    mixed_samples,
+                    source_sample_rate,
+                    file_path,
+                    n8n_enabled,
+                    n8n_endpoint,
+                    save_locally,
+                );
+            });
         }
         
         self.recording = false;
@@ -577,15 +721,133 @@ impl RecorderState {
         *self.input_level.lock().unwrap() = 0.0;
         *self.output_level.lock().unwrap() = 0.0;
         
-        let mut history = self.waveform_history.lock().unwrap();
-        history.iter_mut().for_each(|v| *v = 0.0);
+        // Reset all waveform histories
+        self.waveform_history.lock().unwrap().iter_mut().for_each(|v| *v = 0.0);
+        self.input_waveform_history.lock().unwrap().iter_mut().for_each(|v| *v = 0.0);
+        self.output_waveform_history.lock().unwrap().iter_mut().for_each(|v| *v = 0.0);
     }
 }
 
-async fn upload_to_n8n(file_path: &str, endpoint: &str) -> Result<(), Box<dyn std::error::Error>> {
+// Target sample rate for export (16kHz for smaller file size, good for speech)
+const EXPORT_SAMPLE_RATE: u32 = 16000;
+
+/// Resample audio from source_rate to target_rate using linear interpolation
+fn resample_audio(samples: &[f32], source_rate: u32, target_rate: u32) -> Vec<f32> {
+    if source_rate == target_rate {
+        return samples.to_vec();
+    }
+    
+    let ratio = source_rate as f64 / target_rate as f64;
+    let new_len = (samples.len() as f64 / ratio) as usize;
+    
+    (0..new_len)
+        .map(|i| {
+            let src_pos = i as f64 * ratio;
+            let src_idx = src_pos as usize;
+            let frac = src_pos - src_idx as f64;
+            
+            let sample1 = samples.get(src_idx).copied().unwrap_or(0.0);
+            let sample2 = samples.get(src_idx + 1).copied().unwrap_or(sample1);
+            
+            // Linear interpolation
+            (sample1 as f64 * (1.0 - frac) + sample2 as f64 * frac) as f32
+        })
+        .collect()
+}
+
+/// Encode and save recording in a background thread (16kHz mono OGG)
+fn encode_and_save_recording(
+    samples: Vec<f32>,
+    source_sample_rate: u32,
+    file_path: String,
+    n8n_enabled: bool,
+    n8n_endpoint: Option<String>,
+    save_locally: bool,
+) {
+    use std::num::NonZero;
+    
+    println!("Starting encoding: {} samples at {} Hz -> {} Hz", 
+             samples.len(), source_sample_rate, EXPORT_SAMPLE_RATE);
+    
+    // Resample to 16kHz for smaller file size
+    let resampled = resample_audio(&samples, source_sample_rate, EXPORT_SAMPLE_RATE);
+    println!("Resampled to {} samples", resampled.len());
+    
+    let file = match File::create(&file_path) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("Failed to create file {}: {}", file_path, e);
+            show_notification("Erreur", &format!("Impossible de créer le fichier: {}", e));
+            return;
+        }
+    };
+    
+    let sample_rate = NonZero::new(EXPORT_SAMPLE_RATE).unwrap();
+    let channels = NonZero::new(1u8).unwrap();
+    
+    let encoder_result = VorbisEncoderBuilder::new(sample_rate, channels, file)
+        .and_then(|mut builder| builder.build());
+    
+    let mut encoder = match encoder_result {
+        Ok(enc) => enc,
+        Err(e) => {
+            eprintln!("Failed to create encoder: {:?}", e);
+            show_notification("Erreur", "Impossible de créer l'encodeur audio");
+            return;
+        }
+    };
+    
+    // Encode in chunks (1 second at a time)
+    let chunk_size = EXPORT_SAMPLE_RATE as usize;
+    let num_samples = resampled.len();
+    
+    for start in (0..num_samples).step_by(chunk_size) {
+        let end = (start + chunk_size).min(num_samples);
+        let chunk = vec![resampled[start..end].to_vec()];
+        if let Err(e) = encoder.encode_audio_block(chunk) {
+            eprintln!("Encoding error: {:?}", e);
+        }
+    }
+    
+    if let Err(e) = encoder.finish() {
+        eprintln!("Error finishing encoder: {:?}", e);
+        show_notification("Erreur", "Erreur lors de la finalisation de l'encodage");
+        return;
+    }
+    
+    println!("Saved: {}", file_path);
+    show_notification("Enregistrement sauvegardé", &file_path);
+    
+    // Upload to N8N if enabled
+    if n8n_enabled {
+        if let Some(endpoint) = n8n_endpoint {
+            match upload_to_n8n_sync(&file_path, &endpoint) {
+                Ok(_) => {
+                    println!("Upload to N8N succeeded");
+                    show_notification("Upload réussi", "Le fichier a été envoyé à N8N");
+                    
+                    // Delete local file if not configured to keep it
+                    if !save_locally {
+                        if let Err(e) = std::fs::remove_file(&file_path) {
+                            eprintln!("Failed to delete local file: {}", e);
+                        } else {
+                            println!("Local file deleted (save_locally=false)");
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Upload to N8N failed: {}", e);
+                    show_notification("Échec de l'upload", &format!("Erreur: {}", e));
+                }
+            }
+        }
+    }
+}
+
+/// Synchronous N8N upload (for use in background thread)
+fn upload_to_n8n_sync(file_path: &str, endpoint: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     println!("Starting upload to N8N: {} -> {}", file_path, endpoint);
     
-    // Read file synchronously (we're in a glib async context, not tokio)
     let file_content = std::fs::read(file_path)?;
     let filename = std::path::Path::new(file_path)
         .file_name()
@@ -593,7 +855,6 @@ async fn upload_to_n8n(file_path: &str, endpoint: &str) -> Result<(), Box<dyn st
         .unwrap_or("recording.ogg")
         .to_string();
     
-    // Create multipart form for blocking client
     let file_part = reqwest::blocking::multipart::Part::bytes(file_content)
         .file_name(filename.clone())
         .mime_str("audio/ogg")?;
@@ -603,9 +864,8 @@ async fn upload_to_n8n(file_path: &str, endpoint: &str) -> Result<(), Box<dyn st
         .text("filename", filename)
         .text("timestamp", Local::now().to_rfc3339());
     
-    // Send request with 30s timeout (using blocking client in async context)
     let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
+        .timeout(std::time::Duration::from_secs(60))
         .build()?;
     
     let response = client
@@ -633,7 +893,7 @@ fn build_ui(app: &Application) {
         .application(app)
         .title("Audio Recorder")
         .default_width(380)
-        .default_height(130)
+        .default_height(160)
         .resizable(false)
         .decorated(false) // No window borders (popup style)
         .build();
@@ -708,6 +968,17 @@ fn build_ui(app: &Application) {
         }
         window.dialog headerbar {
             min-height: 38px;
+        }
+        .waveform-label {
+            font-size: 9px;
+            color: #666;
+            font-weight: 500;
+        }
+        .waveform-label-mic {
+            color: #22c55e;
+        }
+        .waveform-label-system {
+            color: #3b82f6;
         }
     ");
     
@@ -787,55 +1058,54 @@ fn build_ui(app: &Application) {
     vbox.append(&titlebar);
     
     // Content container
-    let content = gtk4::Box::new(Orientation::Vertical, 10);
-    content.set_margin_top(8);
-    content.set_margin_bottom(16);
+    let content = gtk4::Box::new(Orientation::Vertical, 4);
+    content.set_margin_top(4);
+    content.set_margin_bottom(12);
     content.set_margin_start(16);
     content.set_margin_end(16);
 
-    // Waveform drawing area
-    let drawing_area = DrawingArea::new();
-    drawing_area.set_content_width(348);
-    drawing_area.set_content_height(50);
+    // Microphone waveform section
+    let mic_label = gtk4::Label::new(Some("🎤 Mic"));
+    mic_label.set_halign(gtk4::Align::Start);
+    mic_label.add_css_class("waveform-label");
+    mic_label.add_css_class("waveform-label-mic");
+    content.append(&mic_label);
+
+    // Microphone waveform drawing area
+    let mic_drawing_area = DrawingArea::new();
+    mic_drawing_area.set_content_width(348);
+    mic_drawing_area.set_content_height(22);
     
     let state_clone = Rc::clone(&state);
-    drawing_area.set_draw_func(move |_area, cr, width, height| {
+    mic_drawing_area.set_draw_func(move |_area, cr, width, height| {
         let state = state_clone.borrow();
-        
-        // Background
-            let _ = cr.set_source_rgb(0.95, 0.96, 0.96);
-        let _ = cr.rectangle(0.0, 0.0, width as f64, height as f64);
-        let _ = cr.fill();
-        
-        // Bars
-        let waveform_data = state.waveform_history.lock().unwrap();
-        let num_bars = 60;
-        let bar_width = 3.0;
-        let spacing = (width as f64 - (num_bars as f64 * bar_width)) / (num_bars as f64 + 1.0);
-        
-        for i in 0..num_bars {
-            let x = spacing + (i as f64 * (bar_width + spacing));
-            let level = if i < waveform_data.len() {
-                waveform_data[i] as f64
-            } else {
-                0.0
-            };
-            
-            let bar_height = (level * height as f64 * 0.8).max(4.0).min(height as f64 * 0.9);
-            let y = (height as f64 - bar_height) / 2.0;
-            
-            if state.recording && level > 0.05 {
-                cr.set_source_rgb(0.13, 0.77, 0.37); // Green
-            } else {
-                cr.set_source_rgb(0.82, 0.84, 0.86); // Gray
-            }
-            
-            let _ = cr.rectangle(x, y, bar_width, bar_height);
-            let _ = cr.fill();
-        }
+        let waveform_data = state.input_waveform_history.lock().unwrap();
+        draw_waveform_bars(cr, &waveform_data, width, height, state.recording, (0.13, 0.77, 0.37)); // Green for mic
     });
     
-    content.append(&drawing_area);
+    content.append(&mic_drawing_area);
+
+    // System audio waveform section
+    let system_label = gtk4::Label::new(Some("🔊 System"));
+    system_label.set_halign(gtk4::Align::Start);
+    system_label.add_css_class("waveform-label");
+    system_label.add_css_class("waveform-label-system");
+    system_label.set_margin_top(4);
+    content.append(&system_label);
+
+    // System audio waveform drawing area
+    let system_drawing_area = DrawingArea::new();
+    system_drawing_area.set_content_width(348);
+    system_drawing_area.set_content_height(22);
+    
+    let state_clone = Rc::clone(&state);
+    system_drawing_area.set_draw_func(move |_area, cr, width, height| {
+        let state = state_clone.borrow();
+        let waveform_data = state.output_waveform_history.lock().unwrap();
+        draw_waveform_bars(cr, &waveform_data, width, height, state.recording, (0.23, 0.51, 0.96)); // Blue for system
+    });
+    
+    content.append(&system_drawing_area);
 
     // Controls
     let controls = gtk4::Box::new(Orientation::Horizontal, 20);
@@ -860,7 +1130,8 @@ fn build_ui(app: &Application) {
     // Record/Stop button
     let record_button = Button::with_label("⏺");
     let state_clone = Rc::clone(&state);
-    let drawing_area_clone = drawing_area.clone();
+    let mic_drawing_area_clone = mic_drawing_area.clone();
+    let system_drawing_area_clone = system_drawing_area.clone();
     record_button.connect_clicked(move |button| {
         let mut state = state_clone.borrow_mut();
         if state.recording {
@@ -870,7 +1141,8 @@ fn build_ui(app: &Application) {
             state.start_recording();
             button.set_label("⏹");
         }
-        drawing_area_clone.queue_draw();
+        mic_drawing_area_clone.queue_draw();
+        system_drawing_area_clone.queue_draw();
     });
     controls.append(&record_button);
 
@@ -906,7 +1178,8 @@ fn build_ui(app: &Application) {
     // Update timer and waveform
     let state_clone = Rc::clone(&state);
     let timer_label_clone = timer_label.clone();
-    let drawing_area_clone = drawing_area.clone();
+    let mic_drawing_area_clone = mic_drawing_area.clone();
+    let system_drawing_area_clone = system_drawing_area.clone();
     glib::timeout_add_local(Duration::from_millis(50), move || {
         let mut state = state_clone.borrow_mut();
         if state.recording && !state.paused {
@@ -918,7 +1191,8 @@ fn build_ui(app: &Application) {
                 timer_label_clone.set_text(&format!("00:{:02}:{:02}", mins, secs));
             }
         }
-        drawing_area_clone.queue_draw();
+        mic_drawing_area_clone.queue_draw();
+        system_drawing_area_clone.queue_draw();
         glib::ControlFlow::Continue
     });
 }
