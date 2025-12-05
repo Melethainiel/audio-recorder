@@ -21,6 +21,28 @@ static WINDOW_VISIBLE: Mutex<Option<Arc<Mutex<bool>>>> = Mutex::new(None);
 // Global notifier instance
 static NOTIFIER: Mutex<Option<notifier::Notifier>> = Mutex::new(None);
 
+// Global recording state for tray icon control
+static RECORDING_STATE: Mutex<Option<Arc<Mutex<TrayRecordingState>>>> = Mutex::new(None);
+
+// Channel for sending upload dialogs to the main thread
+static UPLOAD_DIALOG_SENDER: Mutex<Option<std::sync::mpsc::Sender<UploadDialogRequest>>> = Mutex::new(None);
+
+#[derive(Clone, Default)]
+struct TrayRecordingState {
+    recording: bool,
+    paused: bool,
+    // Signals to trigger actions from tray
+    start_requested: bool,
+    stop_requested: bool,
+    pause_requested: bool,
+}
+
+struct UploadDialogRequest {
+    file_path: String,
+    endpoint: String,
+    save_locally: bool,
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 struct Config {
     selected_mic_index: usize,
@@ -89,7 +111,10 @@ fn main() -> glib::ExitCode {
 fn start_tray_icon() {
     use ksni::TrayService;
     
-    struct RecorderTray;
+    struct RecorderTray {
+        recording: bool,
+        paused: bool,
+    }
     
     impl ksni::Tray for RecorderTray {
         fn id(&self) -> String {
@@ -97,11 +122,23 @@ fn start_tray_icon() {
         }
         
         fn title(&self) -> String {
-            "Audio Recorder".to_string()
+            if self.recording {
+                if self.paused {
+                    "Audio Recorder (Paused)".to_string()
+                } else {
+                    "Audio Recorder (Recording...)".to_string()
+                }
+            } else {
+                "Audio Recorder".to_string()
+            }
         }
         
         fn icon_name(&self) -> String {
-            "audio-input-microphone".to_string()
+            if self.recording && !self.paused {
+                "media-record".to_string()
+            } else {
+                "audio-input-microphone".to_string()
+            }
         }
         
         fn activate(&mut self, _x: i32, _y: i32) {
@@ -116,7 +153,8 @@ fn start_tray_icon() {
         
         fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
             use ksni::menu::*;
-            vec![
+            
+            let mut items = vec![
                 StandardItem {
                     label: "Show/Hide".to_string(),
                     activate: Box::new(|_| {
@@ -124,14 +162,61 @@ fn start_tray_icon() {
                     }),
                     ..Default::default()
                 }.into(),
-                StandardItem {
-                    label: "Quit".to_string(),
+            ];
+            
+            // Add separator
+            items.push(ksni::MenuItem::Separator);
+            
+            // Recording controls based on state
+            if !self.recording {
+                items.push(StandardItem {
+                    label: "▶ Start Recording".to_string(),
                     activate: Box::new(|_| {
-                        std::process::exit(0);
+                        request_start_recording();
                     }),
                     ..Default::default()
-                }.into(),
-            ]
+                }.into());
+            } else {
+                // Recording in progress
+                if self.paused {
+                    items.push(StandardItem {
+                        label: "▶ Resume".to_string(),
+                        activate: Box::new(|_| {
+                            request_pause_recording();
+                        }),
+                        ..Default::default()
+                    }.into());
+                } else {
+                    items.push(StandardItem {
+                        label: "⏸ Pause".to_string(),
+                        activate: Box::new(|_| {
+                            request_pause_recording();
+                        }),
+                        ..Default::default()
+                    }.into());
+                }
+                
+                items.push(StandardItem {
+                    label: "⏹ Stop Recording".to_string(),
+                    activate: Box::new(|_| {
+                        request_stop_recording();
+                    }),
+                    ..Default::default()
+                }.into());
+            }
+            
+            // Add separator before Quit
+            items.push(ksni::MenuItem::Separator);
+            
+            items.push(StandardItem {
+                label: "Quit".to_string(),
+                activate: Box::new(|_| {
+                    std::process::exit(0);
+                }),
+                ..Default::default()
+            }.into());
+            
+            items
         }
     }
     
@@ -146,12 +231,78 @@ fn start_tray_icon() {
         }
     }
     
-    let service = TrayService::new(RecorderTray);
-    let _handle = service.spawn();
+    fn request_start_recording() {
+        if let Ok(guard) = RECORDING_STATE.lock() {
+            if let Some(state_ref) = guard.as_ref() {
+                if let Ok(mut state) = state_ref.lock() {
+                    state.start_requested = true;
+                    println!("Start recording requested from tray");
+                }
+            }
+        }
+    }
+    
+    fn request_stop_recording() {
+        if let Ok(guard) = RECORDING_STATE.lock() {
+            if let Some(state_ref) = guard.as_ref() {
+                if let Ok(mut state) = state_ref.lock() {
+                    state.stop_requested = true;
+                    println!("Stop recording requested from tray");
+                }
+            }
+        }
+    }
+    
+    fn request_pause_recording() {
+        if let Ok(guard) = RECORDING_STATE.lock() {
+            if let Some(state_ref) = guard.as_ref() {
+                if let Ok(mut state) = state_ref.lock() {
+                    state.pause_requested = true;
+                    println!("Pause toggle requested from tray");
+                }
+            }
+        }
+    }
+    
+    let service = TrayService::new(RecorderTray { recording: false, paused: false });
+    let handle = service.handle();
+    service.spawn();
+    
     println!("Tray icon started!");
-    // Keep the service alive
+    
+    // Poll for state changes and update tray
+    let mut last_recording = false;
+    let mut last_paused = false;
+    
     loop {
-        std::thread::sleep(Duration::from_secs(1));
+        std::thread::sleep(Duration::from_millis(200));
+        
+        // Get current state from global
+        let (recording, paused) = {
+            if let Ok(guard) = RECORDING_STATE.lock() {
+                if let Some(state_ref) = guard.as_ref() {
+                    if let Ok(state) = state_ref.lock() {
+                        (state.recording, state.paused)
+                    } else {
+                        (false, false)
+                    }
+                } else {
+                    (false, false)
+                }
+            } else {
+                (false, false)
+            }
+        };
+        
+        // If state changed, update tray
+        if recording != last_recording || paused != last_paused {
+            handle.update(|tray: &mut RecorderTray| {
+                tray.recording = recording;
+                tray.paused = paused;
+            });
+            last_recording = recording;
+            last_paused = paused;
+        }
     }
 }
 
@@ -818,26 +969,22 @@ fn encode_and_save_recording(
     println!("Saved: {}", file_path);
     show_notification("Enregistrement sauvegardé", &file_path);
     
-    // Upload to N8N if enabled
+    // Upload to N8N if enabled - send request to main thread for dialog
     if n8n_enabled {
         if let Some(endpoint) = n8n_endpoint {
-            match upload_to_n8n_sync(&file_path, &endpoint) {
-                Ok(_) => {
-                    println!("Upload to N8N succeeded");
-                    show_notification("Upload réussi", "Le fichier a été envoyé à N8N");
-                    
-                    // Delete local file if not configured to keep it
-                    if !save_locally {
-                        if let Err(e) = std::fs::remove_file(&file_path) {
-                            eprintln!("Failed to delete local file: {}", e);
-                        } else {
-                            println!("Local file deleted (save_locally=false)");
-                        }
+            // Send upload request to main thread which will show the dialog
+            if let Ok(guard) = UPLOAD_DIALOG_SENDER.lock() {
+                if let Some(sender) = guard.as_ref() {
+                    let request = UploadDialogRequest {
+                        file_path: file_path.clone(),
+                        endpoint,
+                        save_locally,
+                    };
+                    if let Err(e) = sender.send(request) {
+                        eprintln!("Failed to send upload dialog request: {}", e);
                     }
-                }
-                Err(e) => {
-                    eprintln!("Upload to N8N failed: {}", e);
-                    show_notification("Échec de l'upload", &format!("Erreur: {}", e));
+                } else {
+                    eprintln!("Upload dialog sender not initialized");
                 }
             }
         }
@@ -845,8 +992,8 @@ fn encode_and_save_recording(
 }
 
 /// Synchronous N8N upload (for use in background thread)
-fn upload_to_n8n_sync(file_path: &str, endpoint: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    println!("Starting upload to N8N: {} -> {}", file_path, endpoint);
+fn upload_to_n8n_sync(file_path: &str, endpoint: &str, min_speakers: u32, max_speakers: u32) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    println!("Starting upload to N8N: {} -> {} (speakers: {}-{})", file_path, endpoint, min_speakers, max_speakers);
     
     let file_content = std::fs::read(file_path)?;
     let filename = std::path::Path::new(file_path)
@@ -862,7 +1009,9 @@ fn upload_to_n8n_sync(file_path: &str, endpoint: &str) -> Result<(), Box<dyn std
     let form = reqwest::blocking::multipart::Form::new()
         .part("file", file_part)
         .text("filename", filename)
-        .text("timestamp", Local::now().to_rfc3339());
+        .text("timestamp", Local::now().to_rfc3339())
+        .text("min_speakers", min_speakers.to_string())
+        .text("max_speakers", max_speakers.to_string());
     
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(60))
@@ -1004,6 +1153,24 @@ fn build_ui(app: &Application) {
     });
 
     let state = Rc::new(RefCell::new(RecorderState::new()));
+    
+    // Setup global recording state for tray icon
+    let tray_state = Arc::new(Mutex::new(TrayRecordingState::default()));
+    *RECORDING_STATE.lock().unwrap() = Some(Arc::clone(&tray_state));
+    
+    // Setup channel for upload dialog requests
+    let (sender, receiver) = std::sync::mpsc::channel::<UploadDialogRequest>();
+    *UPLOAD_DIALOG_SENDER.lock().unwrap() = Some(sender);
+    
+    // Handle upload dialog requests on main thread via timeout polling
+    let window_for_dialog = window.clone();
+    glib::timeout_add_local(Duration::from_millis(100), move || {
+        // Check for pending upload dialog requests (non-blocking)
+        while let Ok(request) = receiver.try_recv() {
+            show_upload_dialog(Some(&window_for_dialog), request);
+        }
+        glib::ControlFlow::Continue
+    });
     
     // Setup window visibility control (needed early for close button)
     let visible = Arc::new(Mutex::new(false)); // Start hidden
@@ -1180,8 +1347,34 @@ fn build_ui(app: &Application) {
     let timer_label_clone = timer_label.clone();
     let mic_drawing_area_clone = mic_drawing_area.clone();
     let system_drawing_area_clone = system_drawing_area.clone();
+    let record_button_clone = record_button.clone();
+    let tray_state_clone = Arc::clone(&tray_state);
     glib::timeout_add_local(Duration::from_millis(50), move || {
         let mut state = state_clone.borrow_mut();
+        
+        // Check for tray icon commands
+        if let Ok(mut tray) = tray_state_clone.try_lock() {
+            if tray.start_requested && !state.recording {
+                state.start_recording();
+                record_button_clone.set_label("⏹");
+                tray.start_requested = false;
+            }
+            if tray.stop_requested && state.recording {
+                state.stop_recording();
+                record_button_clone.set_label("⏺");
+                timer_label_clone.set_text("00:00:00");
+                tray.stop_requested = false;
+            }
+            if tray.pause_requested && state.recording {
+                state.paused = !state.paused;
+                tray.pause_requested = false;
+            }
+            
+            // Update tray state
+            tray.recording = state.recording;
+            tray.paused = state.paused;
+        }
+        
         if state.recording && !state.paused {
             if let Some(start) = state.start_time {
                 state.elapsed = start.elapsed();
@@ -1521,6 +1714,206 @@ fn show_settings_dialog(parent: &ApplicationWindow, state: &Rc<RefCell<RecorderS
                 // Save config
                 state.save_config();
             }
+            dialog.close();
+        }
+    });
+    
+    dialog.present();
+}
+
+fn show_upload_dialog(parent: Option<&ApplicationWindow>, request: UploadDialogRequest) {
+    use gtk4::{Dialog, Label, Box as GtkBox, ResponseType, Button, SpinButton, Adjustment, Entry};
+    
+    let dialog = Dialog::builder()
+        .title("Envoyer vers N8N")
+        .modal(true)
+        .default_width(400)
+        .default_height(240)
+        .build();
+    
+    if let Some(parent_window) = parent {
+        dialog.set_transient_for(Some(parent_window));
+    }
+    
+    let content_area = dialog.content_area();
+    let vbox = GtkBox::new(Orientation::Vertical, 10);
+    vbox.set_margin_top(16);
+    vbox.set_margin_bottom(12);
+    vbox.set_margin_start(16);
+    vbox.set_margin_end(16);
+    
+    // File info
+    let file_name = std::path::Path::new(&request.file_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("recording.ogg");
+    
+    let file_label = Label::builder()
+        .label(&format!("📁 {}", file_name))
+        .halign(gtk4::Align::Start)
+        .build();
+    file_label.add_css_class("settings-label");
+    vbox.append(&file_label);
+    
+    // N8N endpoint URL (overridable)
+    let endpoint_label = Label::builder()
+        .label("URL endpoint N8N:")
+        .halign(gtk4::Align::Start)
+        .margin_top(8)
+        .build();
+    endpoint_label.add_css_class("settings-label");
+    vbox.append(&endpoint_label);
+    
+    let endpoint_entry = Entry::new();
+    endpoint_entry.set_text(&request.endpoint);
+    endpoint_entry.set_placeholder_text(Some("https://..."));
+    endpoint_entry.add_css_class("settings-entry");
+    vbox.append(&endpoint_entry);
+    
+    // Speaker count section
+    let speaker_label = Label::builder()
+        .label("Nombre de locuteurs:")
+        .halign(gtk4::Align::Start)
+        .margin_top(8)
+        .build();
+    speaker_label.add_css_class("settings-label");
+    vbox.append(&speaker_label);
+    
+    // Min/Max row
+    let speaker_box = GtkBox::new(Orientation::Horizontal, 12);
+    speaker_box.set_halign(gtk4::Align::Start);
+    
+    // Min label and spin
+    let min_label = Label::builder()
+        .label("Min:")
+        .build();
+    min_label.add_css_class("settings-label");
+    speaker_box.append(&min_label);
+    
+    let min_adjustment = Adjustment::new(
+        1.0,   // initial value
+        1.0,   // minimum
+        50.0,  // maximum
+        1.0,   // step increment
+        5.0,   // page increment
+        0.0,   // page size
+    );
+    let min_spin = SpinButton::new(Some(&min_adjustment), 1.0, 0);
+    min_spin.set_value(1.0);
+    min_spin.set_width_chars(3);
+    min_spin.add_css_class("settings-entry");
+    speaker_box.append(&min_spin);
+    
+    // Max label and spin
+    let max_label = Label::builder()
+        .label("Max:")
+        .margin_start(16)
+        .build();
+    max_label.add_css_class("settings-label");
+    speaker_box.append(&max_label);
+    
+    let max_adjustment = Adjustment::new(
+        2.0,   // initial value
+        1.0,   // minimum
+        50.0,  // maximum
+        1.0,   // step increment
+        5.0,   // page increment
+        0.0,   // page size
+    );
+    let max_spin = SpinButton::new(Some(&max_adjustment), 1.0, 0);
+    max_spin.set_value(2.0);
+    max_spin.set_width_chars(3);
+    max_spin.add_css_class("settings-entry");
+    speaker_box.append(&max_spin);
+    
+    // Ensure min <= max
+    let max_spin_clone = max_spin.clone();
+    min_spin.connect_value_changed(move |spin| {
+        let min_val = spin.value();
+        if max_spin_clone.value() < min_val {
+            max_spin_clone.set_value(min_val);
+        }
+    });
+    
+    let min_spin_clone = min_spin.clone();
+    max_spin.connect_value_changed(move |spin| {
+        let max_val = spin.value();
+        if min_spin_clone.value() > max_val {
+            min_spin_clone.set_value(max_val);
+        }
+    });
+    
+    vbox.append(&speaker_box);
+    
+    // Button box
+    let button_box = GtkBox::new(Orientation::Horizontal, 12);
+    button_box.set_halign(gtk4::Align::End);
+    button_box.set_margin_top(16);
+    
+    let cancel_button = Button::with_label("Annuler");
+    cancel_button.add_css_class("settings-button");
+    let cancel_dialog = dialog.clone();
+    cancel_button.connect_clicked(move |_| {
+        cancel_dialog.response(ResponseType::Cancel);
+    });
+    
+    let send_button = Button::with_label("Envoyer");
+    send_button.add_css_class("settings-button");
+    send_button.add_css_class("suggested-action");
+    let send_dialog = dialog.clone();
+    send_button.connect_clicked(move |_| {
+        send_dialog.response(ResponseType::Accept);
+    });
+    
+    button_box.append(&cancel_button);
+    button_box.append(&send_button);
+    
+    vbox.append(&button_box);
+    content_area.append(&vbox);
+    
+    let file_path = request.file_path.clone();
+    let save_locally = request.save_locally;
+    
+    dialog.connect_response(move |dialog, response| {
+        if response == ResponseType::Accept {
+            let endpoint = endpoint_entry.text().to_string();
+            
+            // Validate endpoint URL
+            if endpoint.trim().is_empty() {
+                show_notification("Erreur", "L'URL de l'endpoint N8N est requise");
+                return;
+            }
+            
+            let min_speakers = min_spin.value() as u32;
+            let max_speakers = max_spin.value() as u32;
+            let file_path = file_path.clone();
+            
+            // Perform upload in background thread
+            std::thread::spawn(move || {
+                match upload_to_n8n_sync(&file_path, &endpoint, min_speakers, max_speakers) {
+                    Ok(_) => {
+                        println!("Upload to N8N succeeded");
+                        show_notification("Upload réussi", "Le fichier a été envoyé à N8N");
+                        
+                        // Delete local file if not configured to keep it
+                        if !save_locally {
+                            if let Err(e) = std::fs::remove_file(&file_path) {
+                                eprintln!("Failed to delete local file: {}", e);
+                            } else {
+                                println!("Local file deleted (save_locally=false)");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Upload to N8N failed: {}", e);
+                        show_notification("Échec de l'upload", &format!("Erreur: {}", e));
+                    }
+                }
+            });
+            dialog.close();
+        } else {
+            println!("Upload cancelled by user");
+            show_notification("Upload annulé", "L'enregistrement n'a pas été envoyé");
             dialog.close();
         }
     });
